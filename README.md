@@ -14,14 +14,14 @@
 1. **Zero-Anchor Bare-Metal C++20/CUDA `sm_86` Engine (`kernels/`):**
    - `siligemma_bench_sm86` links strictly standard system libraries (`libc`, `libstdc++`, `libm`, `libgcc_s`) with **zero Python, PyTorch, `transformers`, `cuBLAS`, or Form-A CSR dependencies**.
    - `20/20` compiled `sm_86` kernels enforce **`<= 48` registers**, **`0 B` stack**, **`0 B` spill loads/stores**, and **`0` `LDL`/`STL`** SASS instructions.
-   - `tree_reduce_128_sm86` achieves **`0`-ULP** bit-identical binary reduction across CPU/GPU; `[16, 11, 4]` `1-LOP3 + 5-POPC` `SECDED` + `IRIS` `HoloSphereRazorCanary64` passed **`3/3` SEC repairs**, **`3/3` DED SafeHalt traps**, and **`1/1` IRIS Trojan traps**.
+   - `tree_reduce_128_sm86` achieves **`0`-ULP** bit-identical binary reduction across CPU/GPU; `[16, 11, 4]` `1-LOP3 + 5-POPC` `SECDED` protects the `A_16` LSB parity plane (`0x11111111`; bits 1–3 carry quotient indices without ECC), and `HoloSphereRazorCanary64` + `IRIS` passed **`3/3` LSB SEC repairs**, **`3/3` LSB DED traps**, and **`1/1` IRIS Trojan traps** in `run_selftest_gpu`.
 2. **Exact Topology & `bos=2` Tokenizer Fix:**
    - Enforces `bos_token_id = 2` fail-closed in `.slgb` headers and token buffers (`Gemma4Tokenizer` omission caused `WT2_test[0]` to collapse from `4.6484 -> 11.1014` nats in Form A and `4.6075 -> 11.2901` in Form B).
-   - Quantizes all `276` live 2D text linears (`1,055,711,232 B` @ `4.5 bpw g=32`), physically omits **`60` dead `L15..34` `(k_proj, v_proj, k_norm)` tensors** (`18,880,512` params), allocates **`0 B` dynamic VRAM/heap** over `1,000` decode steps (`2,744.94 MiB @ 128K` ctx), and overlaps `17,920 B/tok` pinned host-DMA PLE with **`+0.01%` stall**.
+   - Quantizes all `276` live 2D text linears (`1,055,711,232 B` @ `4.5 bpw g=32`), physically omits **`60` dead `L15..34` `(k_proj, v_proj, k_norm)` tensors** (`18,880,512` params), packs `262` FP32 norm/scalar vectors (`285,987` params) + IEEE CRC-32 verified `.slgb` headers (`2,094,062,080 B`), allocates **`0 B` dynamic VRAM/heap** over `1,000` decode steps (`2,744.94 MiB` = **`2.68 GiB`** @ `128K` ctx), and overlaps `17,920 B/tok` pinned host-DMA PLE with **`+0.01%` stall**.
 3. **Hoisted `256 B` Woodbury & `L10..L14` `20x` `shared_KV` Hub Steering:**
    - Single-update `c_wb_inv_256b` constant-memory `8x8` Cayley–Woodbury steering preserves row norms (`3.67e-9` drift) at `+13.11%` AB/BA overhead (`D=1536`); steering `L10..L14` added `+0.19%` end-to-end latency (`11.180 -> 11.201 ms`), `1.308e-9` CUDA norm drift, `WT2_test -0.0380` nats, and `0` KV writes in `L15..34`.
 4. **`KG-GFB4 PASS` — `0 B`-KV `L25..L33` `K=2` (`44L`) Recurrent Loop (`T_{Inkling2 -> Gemma4}`):**
-   - Looping `L25..L33` with `2,695,680` (`5.14 MiB`) `r=16` `BF16` `(q, mlp, ple)` controllers reserves **`0 B` extra KV cache** (`K=1` zero-init diff = `0.0`), contracts with **`rho_hat = 0.1062` CUDA / `0.1228` Torch** (`<< 0.6180`), and lifts held-out accuracy across all 3 benchmarks (`K=1 -> K=2`):
+   - Looping `L25..L33` with `2,695,680` (`5.14 MiB`) `r=16` `BF16` `(q, mlp, ple)` controllers reserves **`0 B` extra KV cache** (`K=1` zero-init diff = `0.0`), contracts with **`rho_hat = 0.1062` CUDA / `0.1228` Torch** (`<< 0.6180`), and lifts held-out accuracy across all 3 benchmarks (`K=1 -> K=2`) in `Track S184`'s calibrated Torch/CUDA evaluation (`docs/STAGE1_VERDICT.json`; note: the shipped standalone `.slgb` release initializes the `U-4` slot to `K=1` identity `wf=0, wg=0, mq=0` — mathematically `h_out = h_in` — and the C++ bench executes segment re-execution / WT2 timing without an in-binary CD/GSM eval loop):
      - **`WT2_test` (`16x256`):** Torch `5.410329 -> 5.202459` (`-0.207870` nats); CUDA `5.412680 -> 5.205190`
      - **`Countdown_test` (`128`):** `1.376065 -> 1.195397` (**`+0.180667` nats**, 95% CI `[+0.1638, +0.1973]`, `p=9.999e-5`)
      - **`GSM8K_OOD` (`64`):** `1.779174 -> 1.620899` (**`+0.158275` nats**, 95% CI `[+0.1399, +0.1774]`, `p=9.999e-5`)
@@ -89,3 +89,18 @@ python3 -B tools/pack_siligemma_formb.py verify ./gemma4_formb_g32.slgb
 | **Workbench OS & Exoskeleton** | **ML-OS / Aletheion** | Research workbench OS & host hardware exoskeleton | [`Moissanite-Labs/ml-os`](https://github.com/Moissanite-Labs/ml-os) · [`Foundation-0/aletheion`](https://github.com/Foundation-0/aletheion) |
 | **Verification & Audit Harness** | **Aletheia** | 3-mode `-I` parity, R1–R5 fail-closed gates, & leak scanning | [`Foundation-0/aletheia`](https://github.com/Foundation-0/aletheia) |
 | **Five-Layer Stack Blueprint** | **Siliconcordat** | Open L1–L5 stack specification | [`siliconcordat/.github`](https://github.com/siliconcordat/.github) |
+
+---
+
+## Verified Inventory & Errata vs. Immutable Track S184 Docs
+
+The files in `docs/` (`STAGE1_VERDICT.json`, `STAGE1_REPORT.md`, `PREREG_W22_GEMMA4_FORMB.json`, `ARCHITECTURE_FORMB_SILIGEMMA.md` SHA-256 `b7410d0c...`) and `kernels/siligemma_kernels_sm86.cu` (`5ee2e547...`) are preserved byte-identical to the executed **Track S184** RTX 3080 run (`EXPECTED_PINNED_SHA256` in `tests/test_siligemma_cpu.py`). Post-Stage-1 hardening and doc errata are recorded transparently below:
+
+| Item | Historical S184 Doc Value | Verified Code / Artifact Value & Clarification |
+|---|---|---|
+| **FP32 Norm & Scalar Tensor Count** | `247` (`ARCHITECTURE` Table 2.1) | **`262`** tensors (`15 x 8 + 20 x 7 + 2 = 262`; `285,987` FP32 params already included the `15` `k_norm` vectors). |
+| **Checkpoint Text Param Total** | `4,666,330,403` (`ARCHITECTURE` Table 2.1) | **`4,647,449,891`** (`4,628,569,379` active + `18,880,512` dead KV; `4,666,330,403` double-added dead KV). |
+| **Partition 7 & `kArena128K` Sizes** | `19.34 MiB` (`ARCHITECTURE` §3.1) | **`19.28 MiB`** (`20,217,856 B`); `kArena128K` (`2,700,007,680 B`) total VRAM = **`2,744.94 MiB` (`2.68 GiB`)**. |
+| **`[16, 11, 4]` SECDED Protection Scope** | "`3/3` SEC / `3/3` DED / `0` stale logits" | Protects the **`A_16` LSB parity plane (`0x11111111`)** (`run_selftest_gpu` verified injected LSB SEC/DED + IRIS); release hardening added `siligemma_iris_canary_finalize_sm86` + host `evaluate_canary_watchdog` + `.slgb` IEEE CRC-32 + token/position bounds + PLE header verification in `siligemma_arena.hpp`/`siligemma_bench_sm86.cu` (`nvcc` `sm_86` zero-spill/`<= 48`-reg compile & C++20 `make test-cpu` verified; host harness changes not re-executed on RTX 3080). |
+| **Form A Cross-Track Reference Values** | `S182b2` `1,203,561,445 B`, `S184 G0` `5.118627` | Pruned `S182b4` `H1` `model.safetensors` linears = **`1,203,427,606 B`**; `S182b3/b4 H0` `WT2 = 5.116801` vs `S184 G0` `5.118627`. |
+| **EOS Tokens & Bench Mode** | `{1, 106}` in `.slgb` header | `generation_config.json` includes `[1, 106, 50]` (turn stop `50`); `.slgb` stores `{1, 106}` and `siligemma_bench_sm86` runs fixed-length timing/WT2 eval without an EOS loop. |

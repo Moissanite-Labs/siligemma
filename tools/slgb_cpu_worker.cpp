@@ -7,7 +7,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cerrno>
 #include <cfenv>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -62,6 +65,9 @@ static inline float bf16_to_f32(uint16_t b) noexcept {
 static inline uint16_t f32_to_bf16_rne(float f) noexcept {
     uint32_t u = 0u;
     std::memcpy(&u, &f, sizeof(u));
+    if ((u & 0x7FFFFFFFu) > 0x7F800000u) {
+        return static_cast<uint16_t>((u >> 16) | 0x0040u);
+    }
     uint32_t lsb = (u >> 16) & 1u;
     uint32_t rounding_bias = 0x7FFFu + lsb;
     u += rounding_bias;
@@ -192,7 +198,11 @@ static inline void ml_snap_a16_signed4_block16(
     }
 }
 
-static void quantize_rows_g32(
+static inline bool is_finite_bf16(uint16_t b) noexcept {
+    return (b & 0x7F80u) != 0x7F80u;
+}
+
+static bool quantize_rows_g32(
     const uint16_t* bf16_rows,
     int m,
     int k_dim,
@@ -202,12 +212,21 @@ static void quantize_rows_g32(
 ) {
     const int g_per_row = k_dim / 32;
     const int blk_per_row = k_dim / 16;
+    std::atomic<bool> saw_nonfinite{false};
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 16)
 #endif
     for (int r = 0; r < m; ++r) {
+        if (saw_nonfinite.load(std::memory_order_relaxed)) continue;
         const uint16_t* row_bf16 = bf16_rows + static_cast<size_t>(r) * static_cast<size_t>(k_dim);
+        for (int i = 0; i < k_dim; ++i) {
+            if (!is_finite_bf16(row_bf16[i])) {
+                saw_nonfinite.store(true, std::memory_order_relaxed);
+                break;
+            }
+        }
+        if (saw_nonfinite.load(std::memory_order_relaxed)) continue;
         uint64_t* row_w = words_out + static_cast<size_t>(r) * static_cast<size_t>(blk_per_row);
         uint16_t* row_s = scales_out + static_cast<size_t>(r) * static_cast<size_t>(g_per_row);
         std::vector<float> row_rot(static_cast<size_t>(k_dim));
@@ -221,11 +240,20 @@ static void quantize_rows_g32(
             float d01 = x0 - x1;
             float s23 = x2 + x3;
             float d23 = x2 - x3;
-            row_rot[c + 0] = 0.5f * (s01 + s23);
-            row_rot[c + 1] = 0.5f * (d01 + d23);
-            row_rot[c + 2] = 0.5f * (s01 - s23);
-            row_rot[c + 3] = 0.5f * (d01 - d23);
+            float y0 = 0.5f * (s01 + s23);
+            float y1 = 0.5f * (d01 + d23);
+            float y2 = 0.5f * (s01 - s23);
+            float y3 = 0.5f * (d01 - d23);
+            if (!std::isfinite(y0) || !std::isfinite(y1) || !std::isfinite(y2) || !std::isfinite(y3)) {
+                saw_nonfinite.store(true, std::memory_order_relaxed);
+                break;
+            }
+            row_rot[c + 0] = y0;
+            row_rot[c + 1] = y1;
+            row_rot[c + 2] = y2;
+            row_rot[c + 3] = y3;
         }
+        if (saw_nonfinite.load(std::memory_order_relaxed)) continue;
 
         for (int g = 0; g < g_per_row; ++g) {
             const float* xg = &row_rot[static_cast<size_t>(g) * 32u];
@@ -235,14 +263,26 @@ static void quantize_rows_g32(
                 if (a > amax) amax = a;
             }
             float sc = std::max(amax / 7.25f, 1.0e-7f);
+            if (!std::isfinite(amax) || !std::isfinite(sc) || sc <= 0.0f) {
+                saw_nonfinite.store(true, std::memory_order_relaxed);
+                break;
+            }
             float z[16];
             int32_t y_tmp[32];
 
             for (int it = 0; it < 2; ++it) {
                 for (int b = 0; b < 2; ++b) {
-                    for (int i = 0; i < 16; ++i) z[i] = xg[b * 16 + i] / sc;
+                    for (int i = 0; i < 16; ++i) {
+                        z[i] = xg[b * 16 + i] / sc;
+                        if (!std::isfinite(z[i])) {
+                            saw_nonfinite.store(true, std::memory_order_relaxed);
+                            break;
+                        }
+                    }
+                    if (saw_nonfinite.load(std::memory_order_relaxed)) break;
                     ml_snap_a16_signed4_block16(z, ct, &y_tmp[b * 16]);
                 }
+                if (saw_nonfinite.load(std::memory_order_relaxed)) break;
                 float den = 0.0f;
                 float num = 0.0f;
                 for (int i = 0; i < 32; ++i) {
@@ -252,14 +292,31 @@ static void quantize_rows_g32(
                 }
                 den = std::max(den, 1.0f);
                 sc = std::max(std::fabs(num / den), 1.0e-7f);
+                if (!std::isfinite(den) || !std::isfinite(num) || !std::isfinite(sc) || sc <= 0.0f) {
+                    saw_nonfinite.store(true, std::memory_order_relaxed);
+                    break;
+                }
             }
+            if (saw_nonfinite.load(std::memory_order_relaxed)) break;
 
             const uint16_t sc_f16 = f32_to_f16_ieee(sc);
-            const float sc_eff = std::max(f16_to_f32_ieee(sc_f16), 1.0e-7f);
+            const float sc_raw = f16_to_f32_ieee(sc_f16);
+            if (!std::isfinite(sc_raw)) {
+                saw_nonfinite.store(true, std::memory_order_relaxed);
+                break;
+            }
+            const float sc_eff = std::max(sc_raw, 1.0e-7f);
             row_s[g] = sc_f16;
 
             for (int b = 0; b < 2; ++b) {
-                for (int i = 0; i < 16; ++i) z[i] = xg[b * 16 + i] / sc_eff;
+                for (int i = 0; i < 16; ++i) {
+                    z[i] = xg[b * 16 + i] / sc_eff;
+                    if (!std::isfinite(z[i])) {
+                        saw_nonfinite.store(true, std::memory_order_relaxed);
+                        break;
+                    }
+                }
+                if (saw_nonfinite.load(std::memory_order_relaxed)) break;
                 int32_t y_fin[16];
                 ml_snap_a16_signed4_block16(z, ct, y_fin);
                 uint64_t w64 = 0ULL;
@@ -278,6 +335,11 @@ static void quantize_rows_g32(
             }
         }
     }
+    if (saw_nonfinite.load(std::memory_order_relaxed)) {
+        std::fprintf(stderr, "Non-finite BF16 input rejected in quantize_rows_g32\n");
+        return false;
+    }
+    return true;
 }
 
 static void pread_exact(int fd, void* dst, size_t nbytes, uint64_t offset) {
@@ -314,11 +376,31 @@ static int cmd_pack(const char* st_path, const char* slgb_path, const char* jobs
 
     int fd_in = ::open(st_path, O_RDONLY);
     if (fd_in < 0) { std::perror("open input safetensors"); return 1; }
-    int fd_out = ::open(slgb_path, O_RDWR);
-    if (fd_out < 0) { std::perror("open output slgb"); return 1; }
+    struct stat st_in{};
+    if (::fstat(fd_in, &st_in) != 0 || st_in.st_size <= 0) {
+        std::fprintf(stderr, "Invalid input safetensors size\n");
+        ::close(fd_in);
+        return 1;
+    }
+    const uint64_t in_file_bytes = static_cast<uint64_t>(st_in.st_size);
+    int fd_out = ::open(slgb_path, O_RDWR | O_CREAT, 0644);
+    if (fd_out < 0) { std::perror("open output slgb"); ::close(fd_in); return 1; }
+    struct stat st_out{};
+    if (::fstat(fd_out, &st_out) != 0) {
+        std::perror("fstat output slgb");
+        ::close(fd_in);
+        ::close(fd_out);
+        return 1;
+    }
+    const uint64_t out_file_bytes = static_cast<uint64_t>(st_out.st_size);
 
     std::ifstream jf(jobs_path);
-    if (!jf) { std::fprintf(stderr, "Cannot open jobs file: %s\n", jobs_path); return 1; }
+    if (!jf) {
+        std::fprintf(stderr, "Cannot open jobs file: %s\n", jobs_path);
+        ::close(fd_in);
+        ::close(fd_out);
+        return 1;
+    }
 
     std::string line;
     std::vector<uint16_t> bf16_buf;
@@ -326,55 +408,110 @@ static int cmd_pack(const char* st_path, const char* slgb_path, const char* jobs
     std::vector<uint16_t> scales_buf;
     std::vector<float> f32_buf;
     uint64_t total_linears_done = 0u;
+    uint64_t total_embeds_done = 0u;
     uint64_t total_norms_done = 0u;
+    auto span_fits = [](uint64_t off, uint64_t len, uint64_t lim) -> bool {
+        return off <= lim && len <= (lim - off);
+    };
 
     while (std::getline(jf, line)) {
         if (line.empty()) continue;
         std::istringstream iss(line);
         std::string kind;
-        iss >> kind;
+        if (!(iss >> kind)) continue;
         if (kind == "LINEAR") {
             int m = 0, k = 0;
             uint64_t in_off = 0, out_w_off = 0, out_s_off = 0;
-            iss >> m >> k >> in_off >> out_w_off >> out_s_off;
+            if (!(iss >> m >> k >> in_off >> out_w_off >> out_s_off) || m <= 0 || k <= 0 || (k % 32) != 0) {
+                std::fprintf(stderr, "Malformed LINEAR job line\n");
+                return 1;
+            }
+            const uint64_t in_bytes = static_cast<uint64_t>(m) * static_cast<uint64_t>(k) * 2ULL;
+            const uint64_t w_bytes = static_cast<uint64_t>(m) * static_cast<uint64_t>(k / 16) * 8ULL;
+            const uint64_t s_bytes = static_cast<uint64_t>(m) * static_cast<uint64_t>(k / 32) * 2ULL;
+            if (!span_fits(in_off, in_bytes, in_file_bytes) ||
+                !span_fits(out_w_off, w_bytes, out_file_bytes) ||
+                !span_fits(out_s_off, s_bytes, out_file_bytes)) {
+                std::fprintf(stderr, "LINEAR job offset/span out of bounds\n");
+                return 1;
+            }
             const size_t n_elems = static_cast<size_t>(m) * static_cast<size_t>(k);
             bf16_buf.resize(n_elems);
             pread_exact(fd_in, bf16_buf.data(), n_elems * sizeof(uint16_t), in_off);
             words_buf.resize(static_cast<size_t>(m) * static_cast<size_t>(k / 16));
             scales_buf.resize(static_cast<size_t>(m) * static_cast<size_t>(k / 32));
-            quantize_rows_g32(bf16_buf.data(), m, k, ct, words_buf.data(), scales_buf.data());
+            if (!quantize_rows_g32(bf16_buf.data(), m, k, ct, words_buf.data(), scales_buf.data())) {
+                ::close(fd_in);
+                ::close(fd_out);
+                return 1;
+            }
             pwrite_exact(fd_out, words_buf.data(), words_buf.size() * sizeof(uint64_t), out_w_off);
             pwrite_exact(fd_out, scales_buf.data(), scales_buf.size() * sizeof(uint16_t), out_s_off);
             ++total_linears_done;
         } else if (kind == "EMBED") {
             int total_rows = 0, k = 0, chunk_rows = 0;
             uint64_t in_off = 0, out_emb_off = 0, out_w_off = 0, out_s_off = 0;
-            iss >> total_rows >> k >> chunk_rows >> in_off >> out_emb_off >> out_w_off >> out_s_off;
+            if (!(iss >> total_rows >> k >> chunk_rows >> in_off >> out_emb_off >> out_w_off >> out_s_off) ||
+                total_rows <= 0 || k <= 0 || chunk_rows <= 0 || (k % 32) != 0) {
+                std::fprintf(stderr, "Malformed EMBED job line\n");
+                return 1;
+            }
+            const uint64_t emb_bytes = static_cast<uint64_t>(total_rows) * static_cast<uint64_t>(k) * 2ULL;
+            const uint64_t w_bytes = static_cast<uint64_t>(total_rows) * static_cast<uint64_t>(k / 16) * 8ULL;
+            const uint64_t s_bytes = static_cast<uint64_t>(total_rows) * static_cast<uint64_t>(k / 32) * 2ULL;
+            if (!span_fits(in_off, emb_bytes, in_file_bytes) ||
+                !span_fits(out_emb_off, emb_bytes, out_file_bytes) ||
+                !span_fits(out_w_off, w_bytes, out_file_bytes) ||
+                !span_fits(out_s_off, s_bytes, out_file_bytes)) {
+                std::fprintf(stderr, "EMBED job offset/span out of bounds\n");
+                return 1;
+            }
             for (int r0 = 0; r0 < total_rows; r0 += chunk_rows) {
                 int r_cnt = std::min(chunk_rows, total_rows - r0);
                 size_t n_elems = static_cast<size_t>(r_cnt) * static_cast<size_t>(k);
                 bf16_buf.resize(n_elems);
                 uint64_t src_byte = in_off + static_cast<uint64_t>(r0) * static_cast<uint64_t>(k) * 2ULL;
                 pread_exact(fd_in, bf16_buf.data(), n_elems * sizeof(uint16_t), src_byte);
-                uint64_t dst_emb = out_emb_off + static_cast<uint64_t>(r0) * static_cast<uint64_t>(k) * 2ULL;
-                pwrite_exact(fd_out, bf16_buf.data(), n_elems * sizeof(uint16_t), dst_emb);
 
                 words_buf.resize(static_cast<size_t>(r_cnt) * static_cast<size_t>(k / 16));
                 scales_buf.resize(static_cast<size_t>(r_cnt) * static_cast<size_t>(k / 32));
-                quantize_rows_g32(bf16_buf.data(), r_cnt, k, ct, words_buf.data(), scales_buf.data());
+                if (!quantize_rows_g32(bf16_buf.data(), r_cnt, k, ct, words_buf.data(), scales_buf.data())) {
+                    ::close(fd_in);
+                    ::close(fd_out);
+                    return 1;
+                }
+                uint64_t dst_emb = out_emb_off + static_cast<uint64_t>(r0) * static_cast<uint64_t>(k) * 2ULL;
+                pwrite_exact(fd_out, bf16_buf.data(), n_elems * sizeof(uint16_t), dst_emb);
                 uint64_t dst_w = out_w_off + static_cast<uint64_t>(r0) * static_cast<uint64_t>(k / 16) * 8ULL;
                 uint64_t dst_s = out_s_off + static_cast<uint64_t>(r0) * static_cast<uint64_t>(k / 32) * 2ULL;
                 pwrite_exact(fd_out, words_buf.data(), words_buf.size() * sizeof(uint64_t), dst_w);
                 pwrite_exact(fd_out, scales_buf.data(), scales_buf.size() * sizeof(uint16_t), dst_s);
             }
+            ++total_embeds_done;
         } else if (kind == "NORM") {
             size_t cnt = 0;
             uint64_t in_off = 0, out_off = 0;
-            iss >> cnt >> in_off >> out_off;
+            if (!(iss >> cnt >> in_off >> out_off) || cnt == 0u) {
+                std::fprintf(stderr, "Malformed NORM job line\n");
+                return 1;
+            }
+            if (!span_fits(in_off, static_cast<uint64_t>(cnt) * 2ULL, in_file_bytes) ||
+                !span_fits(out_off, static_cast<uint64_t>(cnt) * 4ULL, out_file_bytes)) {
+                std::fprintf(stderr, "NORM job offset/span out of bounds\n");
+                return 1;
+            }
             bf16_buf.resize(cnt);
             f32_buf.resize(cnt);
             pread_exact(fd_in, bf16_buf.data(), cnt * sizeof(uint16_t), in_off);
-            for (size_t i = 0; i < cnt; ++i) f32_buf[i] = bf16_to_f32(bf16_buf[i]);
+            for (size_t i = 0; i < cnt; ++i) {
+                if (!is_finite_bf16(bf16_buf[i])) {
+                    std::fprintf(stderr, "Non-finite BF16 norm input rejected\n");
+                    ::close(fd_in);
+                    ::close(fd_out);
+                    return 1;
+                }
+                f32_buf[i] = bf16_to_f32(bf16_buf[i]);
+            }
             pwrite_exact(fd_out, f32_buf.data(), cnt * sizeof(float), out_off);
             ++total_norms_done;
         } else {
@@ -384,26 +521,50 @@ static int cmd_pack(const char* st_path, const char* slgb_path, const char* jobs
     }
     ::close(fd_in);
     ::close(fd_out);
-    std::printf("PACK_COMPLETE linears=%llu norms=%llu\n",
+    std::printf("PACK_COMPLETE linears=%llu embeds=%llu norms=%llu\n",
                 static_cast<unsigned long long>(total_linears_done),
+                static_cast<unsigned long long>(total_embeds_done),
                 static_cast<unsigned long long>(total_norms_done));
     return 0;
+}
+
+static bool parse_positive_int_strict(const char* s, int max_val, int& out) noexcept {
+    if (s == nullptr || s[0] < '0' || s[0] > '9') return false;
+    errno = 0;
+    char* endptr = nullptr;
+    const long v = std::strtol(s, &endptr, 10);
+    if (errno == ERANGE || endptr == s || *endptr != '\0' || v <= 0 || v > max_val) {
+        return false;
+    }
+    out = static_cast<int>(v);
+    return true;
 }
 
 static int cmd_verify(const char* slgb_path) {
     int fd = ::open(slgb_path, O_RDONLY);
     if (fd < 0) { std::perror("open slgb"); return 1; }
+    struct stat st{};
+    if (::fstat(fd, &st) != 0 || st.st_size < static_cast<off_t>(sizeof(siligemma::SlgbHeader))) {
+        std::fprintf(stderr, "slgb file missing or truncated\n");
+        ::close(fd);
+        return 1;
+    }
+    const uint64_t file_bytes = static_cast<uint64_t>(st.st_size);
     siligemma::SlgbHeader hdr{};
     pread_exact(fd, &hdr, sizeof(hdr), 0ULL);
     if (hdr.magic != siligemma::SLGB_MAGIC || hdr.version != siligemma::SLGB_VERSION) {
         std::fprintf(stderr, "Bad SLGB magic/version\n");
-        return 1;
-    }
-    if (hdr.bos_token_id != siligemma::GEMMA4_BOS_TOKEN_ID) {
-        std::fprintf(stderr, "Bad bos_token_id=%u\n", hdr.bos_token_id);
+        ::close(fd);
         return 1;
     }
     std::array<siligemma::SiliGemmaLayerDesc, siligemma::GEMMA4_NUM_LAYERS> layers{};
+    const uint64_t min_meta = sizeof(hdr) + layers.size() * sizeof(siligemma::SiliGemmaLayerDesc)
+                            + siligemma::LIVE_LINEAR_COUNT * sizeof(siligemma::SiliGemmaLinearDesc);
+    if (file_bytes < min_meta) {
+        std::fprintf(stderr, "slgb descriptor table truncated\n");
+        ::close(fd);
+        return 1;
+    }
     uint64_t off = sizeof(hdr);
     pread_exact(fd, layers.data(), layers.size() * sizeof(siligemma::SiliGemmaLayerDesc), off);
     off += layers.size() * sizeof(siligemma::SiliGemmaLayerDesc);
@@ -411,38 +572,118 @@ static int cmd_verify(const char* slgb_path) {
     pread_exact(fd, linears.data(), linears.size() * sizeof(siligemma::SiliGemmaLinearDesc), off);
     off += linears.size() * sizeof(siligemma::SiliGemmaLinearDesc);
 
-    const uint32_t valid_toks[2] = {2u, 100u};
-    if (siligemma::validate_runtime_contract(hdr, layers, linears, valid_toks, 2u) != siligemma::ValidationError::OK) {
-        std::fprintf(stderr, "validate_runtime_contract failed\n");
+    const siligemma::ValidationError verr = siligemma::validate_slgb_file_layout(hdr, layers, linears, file_bytes, true);
+    if (verr != siligemma::ValidationError::OK) {
+        std::fprintf(stderr, "validate_slgb_file_layout failed err=%d\n", static_cast<int>(verr));
+        ::close(fd);
         return 1;
     }
 
-    uint64_t off_p1 = siligemma::align_up_n(off, 256ULL);
-    uint64_t off_p2_emb = siligemma::align_up_n(off_p1 + hdr.total_wire_bytes, 256ULL);
-    uint64_t off_p2_lm = siligemma::align_up_n(off_p2_emb + siligemma::EMBED_TOKENS_BF16_BYTES, 256ULL);
+    const uint64_t off_p1 = siligemma::align_up_n(off, 256ULL);
+    const uint64_t off_p2_emb = siligemma::align_up_n(off_p1 + hdr.total_wire_bytes, 256ULL);
+    const uint64_t off_p2_lm = siligemma::align_up_n(off_p2_emb + siligemma::EMBED_TOKENS_BF16_BYTES, 256ULL);
+    const uint64_t off_p3_norms = siligemma::align_up_n(
+        (hdr.flags & 1u) ? (off_p2_lm + siligemma::LM_HEAD_SHADOW_G32_BYTES)
+                         : (off_p2_emb + siligemma::EMBED_TOKENS_BF16_BYTES),
+        256ULL
+    );
+    const uint64_t off_p4_loop = siligemma::align_up_n(
+        off_p3_norms + static_cast<uint64_t>(siligemma::NORM_SCALAR_PARAMS_FP32) * sizeof(float),
+        256ULL
+    );
 
     uint64_t total_words = 0ULL;
+    uint64_t total_scales = 0ULL;
     uint64_t syn_errors = 0ULL;
+    uint64_t bad_scales = 0ULL;
     std::vector<uint64_t> chunk_u64(4ULL * 1024ULL * 1024ULL);
 
-    auto scan_words = [&](uint64_t base_off, uint64_t n_words) {
+    auto scan_words = [&](uint64_t base_off, uint64_t n_words) -> uint64_t {
         uint64_t done = 0ULL;
+        uint64_t nonzero = 0ULL;
         while (done < n_words) {
             size_t cnt = static_cast<size_t>(std::min<uint64_t>(n_words - done, chunk_u64.size()));
             pread_exact(fd, chunk_u64.data(), cnt * sizeof(uint64_t), base_off + done * sizeof(uint64_t));
             for (size_t i = 0; i < cnt; ++i) {
-                if (siligemma::a16_secded_syndrome_cpu(chunk_u64[i]) != 0u) ++syn_errors;
+                const uint64_t w64 = chunk_u64[i];
+                if (w64 != 0ULL) ++nonzero;
+                if (siligemma::a16_secded_syndrome_cpu(w64) != 0u) ++syn_errors;
             }
             total_words += cnt;
+            done += cnt;
+        }
+        return nonzero;
+    };
+
+    auto scan_f16_scales = [&](uint64_t base_off, uint64_t n_scales) {
+        const size_t cap_u16 = chunk_u64.size() * 4ULL;
+        const uint16_t* chunk_u16 = reinterpret_cast<const uint16_t*>(chunk_u64.data());
+        uint64_t done = 0ULL;
+        while (done < n_scales) {
+            size_t cnt = static_cast<size_t>(std::min<uint64_t>(n_scales - done, cap_u16));
+            pread_exact(fd, chunk_u64.data(), cnt * sizeof(uint16_t), base_off + done * sizeof(uint16_t));
+            for (size_t i = 0; i < cnt; ++i) {
+                const float sf = f16_to_f32_ieee(chunk_u16[i]);
+                if (!std::isfinite(sf) || sf <= 0.0f) ++bad_scales;
+            }
+            total_scales += cnt;
             done += cnt;
         }
     };
 
     const uint64_t p1_words = siligemma::LIVE_LINEAR_PARAMS / 16ULL;
-    scan_words(off_p1, p1_words);
+    const uint64_t p1_nonzero = scan_words(off_p1, p1_words);
+    for (const auto& d : linears) {
+        const uint64_t n_sc = static_cast<uint64_t>(d.out_dim) * static_cast<uint64_t>(d.in_dim / d.group_size);
+        scan_f16_scales(off_p1 + d.scales_byte_offset, n_sc);
+    }
+    uint64_t lm_nonzero = 0ULL;
     if (hdr.flags & 1u) {
         const uint64_t lm_words = siligemma::EMBED_TOKENS_PARAMS / 16ULL;
-        scan_words(off_p2_lm, lm_words);
+        lm_nonzero = scan_words(off_p2_lm, lm_words);
+        const uint64_t lm_words_bytes = lm_words * sizeof(uint64_t);
+        const uint64_t lm_scales_cnt = siligemma::EMBED_TOKENS_PARAMS / 32ULL;
+        scan_f16_scales(off_p2_lm + lm_words_bytes, lm_scales_cnt);
+    }
+
+    // Verify P2 tied BF16 embed_tokens has finite values and non-zero weights
+    uint64_t emb_nonzero = 0ULL;
+    uint64_t emb_nonfinite = 0ULL;
+    {
+        const uint64_t emb_u16_cnt = siligemma::EMBED_TOKENS_PARAMS;
+        const size_t chunk_u16_cap = chunk_u64.size() * 4ULL;
+        const uint16_t* chunk_u16 = reinterpret_cast<const uint16_t*>(chunk_u64.data());
+        uint64_t done = 0ULL;
+        while (done < emb_u16_cnt) {
+            size_t cnt = static_cast<size_t>(std::min<uint64_t>(emb_u16_cnt - done, chunk_u16_cap));
+            pread_exact(fd, chunk_u64.data(), cnt * sizeof(uint16_t), off_p2_emb + done * sizeof(uint16_t));
+            for (size_t i = 0; i < cnt; ++i) {
+                const uint16_t b = chunk_u16[i];
+                if ((b & 0x7FFFu) != 0u) ++emb_nonzero;
+                if ((b & 0x7F80u) == 0x7F80u) ++emb_nonfinite;
+            }
+            done += cnt;
+        }
+    }
+
+    // Verify P3 norms are finite and non-zero
+    std::vector<float> norms(siligemma::NORM_SCALAR_PARAMS_FP32);
+    pread_exact(fd, norms.data(), norms.size() * sizeof(float), off_p3_norms);
+    uint64_t norms_nonzero = 0ULL;
+    uint64_t norms_nonfinite = 0ULL;
+    for (float v : norms) {
+        if (!std::isfinite(v)) ++norms_nonfinite;
+        if (v != 0.0f) ++norms_nonzero;
+    }
+
+    // Verify P4 loop controller BF16 weights are finite when present
+    uint64_t loop_nonfinite = 0ULL;
+    if (hdr.flags & 2u) {
+        std::vector<uint16_t> loop_bf16(siligemma::LOOP_CONTROLLER_PARAMS);
+        pread_exact(fd, loop_bf16.data(), siligemma::LOOP_CONTROLLER_BF16_BYTES, off_p4_loop);
+        for (uint16_t b : loop_bf16) {
+            if ((b & 0x7F80u) == 0x7F80u) ++loop_nonfinite;
+        }
     }
 
     ::close(fd);
@@ -450,24 +691,56 @@ static int cmd_verify(const char* slgb_path) {
         std::fprintf(stderr, "SECDED errors detected: %llu\n", static_cast<unsigned long long>(syn_errors));
         return 1;
     }
-    std::printf("SLGB_VERIFY_PASS total_words=%llu secded_errors=0\n",
-                static_cast<unsigned long long>(total_words));
+    if (bad_scales != 0ULL || p1_nonzero == 0ULL || ((hdr.flags & 1u) && lm_nonzero == 0ULL) ||
+        emb_nonzero == 0ULL || emb_nonfinite != 0ULL ||
+        norms_nonzero == 0ULL || norms_nonfinite != 0ULL || loop_nonfinite != 0ULL) {
+        std::fprintf(
+            stderr,
+            "SLGB payload content check failed: bad_sc=%llu p1_nz=%llu lm_nz=%llu emb_nz=%llu emb_nf=%llu norm_nz=%llu norm_nf=%llu loop_nf=%llu\n",
+            static_cast<unsigned long long>(bad_scales),
+            static_cast<unsigned long long>(p1_nonzero),
+            static_cast<unsigned long long>(lm_nonzero),
+            static_cast<unsigned long long>(emb_nonzero),
+            static_cast<unsigned long long>(emb_nonfinite),
+            static_cast<unsigned long long>(norms_nonzero),
+            static_cast<unsigned long long>(norms_nonfinite),
+            static_cast<unsigned long long>(loop_nonfinite)
+        );
+        return 1;
+    }
+    std::printf("SLGB_VERIFY_PASS flags=%u total_words=%llu total_scales=%llu secded_errors=0\n",
+                hdr.flags,
+                static_cast<unsigned long long>(total_words),
+                static_cast<unsigned long long>(total_scales));
     return 0;
 }
 
 static int cmd_selftest_quant(const char* in_bf16_path, int m, int k, const char* out_w_path, const char* out_s_path) {
+    if (m <= 0 || k <= 0 || (k % 32) != 0) {
+        std::fprintf(stderr, "Invalid selftest-quant dims: m=%d k=%d\n", m, k);
+        return 1;
+    }
     std::fesetround(FE_TONEAREST);
     const CosetTable ct = build_coset_table();
-    const size_t n = static_cast<size_t>(m) * static_cast<size_t>(k);
-    std::vector<uint16_t> bf16(n);
+    const uint64_t n = static_cast<uint64_t>(m) * static_cast<uint64_t>(k);
+    const uint64_t need_bytes = n * sizeof(uint16_t);
     int fd_i = ::open(in_bf16_path, O_RDONLY);
     if (fd_i < 0) return 1;
-    pread_exact(fd_i, bf16.data(), n * sizeof(uint16_t), 0ULL);
+    struct stat st_i{};
+    if (::fstat(fd_i, &st_i) != 0 || st_i.st_size < 0 || static_cast<uint64_t>(st_i.st_size) != need_bytes) {
+        std::fprintf(stderr, "selftest-quant input size mismatch\n");
+        ::close(fd_i);
+        return 1;
+    }
+    std::vector<uint16_t> bf16(static_cast<size_t>(n));
+    pread_exact(fd_i, bf16.data(), static_cast<size_t>(need_bytes), 0ULL);
     ::close(fd_i);
 
     std::vector<uint64_t> w(static_cast<size_t>(m) * static_cast<size_t>(k / 16));
     std::vector<uint16_t> s(static_cast<size_t>(m) * static_cast<size_t>(k / 32));
-    quantize_rows_g32(bf16.data(), m, k, ct, w.data(), s.data());
+    if (!quantize_rows_g32(bf16.data(), m, k, ct, w.data(), s.data())) {
+        return 1;
+    }
 
     int fd_w = ::open(out_w_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     int fd_s = ::open(out_s_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -493,7 +766,12 @@ int main(int argc, char** argv) {
         return cmd_pack(argv[2], argv[3], argv[4]);
     }
     if (argc >= 2 && std::string(argv[1]) == "--selftest-quant" && argc == 7) {
-        return cmd_selftest_quant(argv[2], std::atoi(argv[3]), std::atoi(argv[4]), argv[5], argv[6]);
+        int m = 0, k = 0;
+        if (!parse_positive_int_strict(argv[3], 65536, m) || !parse_positive_int_strict(argv[4], 65536, k)) {
+            std::fprintf(stderr, "Invalid selftest-quant integer dimensions\n");
+            return 2;
+        }
+        return cmd_selftest_quant(argv[2], m, k, argv[5], argv[6]);
     }
     std::fprintf(stderr, "Usage:\n  %s --pack <model.safetensors> <out.slgb> <jobs.txt>\n  %s --verify <in.slgb>\n", argv[0], argv[0]);
     return 2;

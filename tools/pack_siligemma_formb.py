@@ -4,8 +4,8 @@
 Compiles `slgb_cpu_worker.cpp` into a temporary directory (deleted on exit), streams tensors
 one at a time from `model.safetensors` (< 250 MiB peak RAM, zero PyTorch / GPU locks), packs
 `gemma4_formb_g32.slgb` (276 live A_16-BlockH4 g=32 linears, 60 dead KV tensors omitted,
-BF16 embed_tokens + 4.5 bpw lm_head shadow, 247 FP32 norms, zero-init K=1 identity U-4 slot),
-and verifies 100% of [16, 11, 4] Extended Hamming syndromes.
+BF16 embed_tokens + 4.5 bpw lm_head shadow, 262 FP32 norms/scalars, zero-init K=1 identity U-4 slot),
+and verifies full [16, 11, 4] Extended Hamming syndromes.
 """
 
 from __future__ import annotations
@@ -17,12 +17,14 @@ import math
 import os
 from pathlib import Path
 import random
+import re
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
 from typing import Any
+import zlib
 
 sys.dont_write_bytecode = True
 
@@ -194,8 +196,9 @@ def compute_slgb_section_offsets(wire_bytes: int, *, has_lm_shadow: bool = True,
 
 
 def pack_slgb_header_and_descs(geom: dict[str, Any], *, flags: int = 3) -> bytes:
-    hdr = struct.pack(
-        "<7I6H2fQ2I",
+    group_size = int(geom["linears"][0]["group_size"])
+    hdr_prefix = struct.pack(
+        "<7I6H2fQI",
         SLGB_MAGIC,
         SLGB_VERSION,
         GEMMA4_BOS_ID,
@@ -206,15 +209,16 @@ def pack_slgb_header_and_descs(geom: dict[str, Any], *, flags: int = 3) -> bytes
         GEMMA4_HIDDEN,
         GEMMA4_NUM_LAYERS,
         20,
-        32,
+        group_size,
         LIVE_LINEAR_COUNT,
         DEAD_KV_OMITTED,
         GEMMA4_SOFTCAP,
         GEMMA4_RMS_EPS,
         int(geom["total_wire_bytes"]),
         int(flags),
-        0,
     )
+    crc = zlib.crc32(hdr_prefix + b"\x00\x00\x00\x00") & 0xFFFFFFFF
+    hdr = hdr_prefix + struct.pack("<I", crc)
     chunks = [hdr]
     for ly in geom["layers"]:
         chunks.append(struct.pack(
@@ -245,6 +249,8 @@ def pack_slgb_header_and_descs(geom: dict[str, Any], *, flags: int = 3) -> bytes
 
 def _f32_to_bf16_u16(val: float) -> int:
     u = struct.unpack("<I", struct.pack("<f", float(val)))[0]
+    if (u & 0x7FFFFFFF) > 0x7F800000:
+        return ((u >> 16) | 0x0040) & 0xFFFF
     lsb = (u >> 16) & 1
     u = (u + 0x7FFF + lsb) & 0xFFFFFFFF
     return (u >> 16) & 0xFFFF
@@ -287,16 +293,123 @@ def _compile_worker(td: Path) -> Path:
     return bin_p
 
 
+def _reject_nonfinite(tok: str) -> Any:
+    raise ValueError(f"Non-finite JSON constant in safetensors header: {tok!r}")
+
+
+def _reject_dup_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in pairs:
+        if k in out:
+            raise ValueError(f"Duplicate JSON key in safetensors header: {k!r}")
+        out[k] = v
+    return out
+
+
+def validate_safetensors_tensor_spans(hdr: dict[str, Any], geom: dict[str, Any], *, data_bytes_avail: int | None = None) -> None:
+    """Validate dtype, shape, byte-span length, bounds, and non-overlapping spans for all packed tensors."""
+    spans: list[tuple[int, int, str]] = []
+
+    def _check_entry(key: str, exp_dtype: str, exp_shapes: list[list[int]], exp_bytes: int) -> None:
+        if key not in hdr or not isinstance(hdr[key], dict):
+            raise ValueError(f"Missing or malformed safetensors tensor key: {key}")
+        entry = hdr[key]
+        if entry.get("dtype") != exp_dtype:
+            raise ValueError(f"Expected {exp_dtype} for {key}, got {entry.get('dtype')}")
+        sh_raw = entry.get("shape")
+        if not isinstance(sh_raw, list) or any(type(d) is not int for d in sh_raw):
+            raise ValueError(f"Non-integer shape for {key}: {sh_raw!r}")
+        if sh_raw not in exp_shapes:
+            raise ValueError(f"Shape mismatch for {key}: {sh_raw} not in {exp_shapes}")
+        offs = entry.get("data_offsets")
+        if not isinstance(offs, list) or len(offs) != 2 or type(offs[0]) is not int or type(offs[1]) is not int:
+            raise ValueError(f"Missing or non-integer data_offsets for {key}: {offs!r}")
+        s_off, e_off = offs[0], offs[1]
+        if s_off < 0 or e_off <= s_off or (e_off - s_off) != exp_bytes:
+            raise ValueError(f"Byte-span mismatch for {key}: [{s_off}, {e_off}) vs expected {exp_bytes}")
+        if data_bytes_avail is not None and e_off > data_bytes_avail:
+            raise ValueError(f"Out-of-file span for {key}: {e_off} > {data_bytes_avail}")
+        spans.append((s_off, e_off, key))
+
+    for d in geom["linears"]:
+        _check_entry(
+            f"model.language_model.{d['name']}.weight",
+            "BF16",
+            [[int(d["out_dim"]), int(d["in_dim"])]],
+            int(d["out_dim"]) * int(d["in_dim"]) * 2,
+        )
+
+    _check_entry(
+        "model.language_model.embed_tokens.weight",
+        "BF16",
+        [[GEMMA4_VOCAB, GEMMA4_HIDDEN]],
+        EMBED_BF16_BYTES,
+    )
+
+    for ns in geom["norm_specs"]:
+        exp_shapes = [[int(ns["count"])], []] if int(ns["count"]) == 1 else [[int(ns["count"])]]
+        _check_entry(
+            f"model.language_model.{ns['key']}",
+            "BF16",
+            exp_shapes,
+            int(ns["count"]) * 2,
+        )
+
+    spans.sort(key=lambda item: (item[0], item[1]))
+    prev_end = -1
+    prev_key = ""
+    for s_off, e_off, key in spans:
+        if s_off < prev_end:
+            raise ValueError(f"Overlapping safetensors spans: {prev_key} vs {key}")
+        prev_end = e_off
+        prev_key = key
+
+
+def _verify_worker_outputs(pack_stdout: str | None, verify_stdout: str) -> None:
+    geom = build_gemma4_descriptor_geometry(32)
+    if pack_stdout is not None:
+        m1 = re.search(r"\bPACK_COMPLETE\s+linears=(\d+)\s+embeds=(\d+)\s+norms=(\d+)\b", pack_stdout)
+        if not m1:
+            raise RuntimeError(f"Worker --pack output missing summary counts: {pack_stdout!r}")
+        exp_linears = LIVE_LINEAR_COUNT
+        exp_norms = len(geom["norm_specs"])
+        if (int(m1.group(1)), int(m1.group(2)), int(m1.group(3))) != (exp_linears, 1, exp_norms):
+            raise RuntimeError(f"Worker --pack incomplete job counts: {m1.group(0)!r}")
+    exp_words = (sum(int(d["out_dim"]) * int(d["in_dim"]) for d in geom["linears"]) + GEMMA4_VOCAB * GEMMA4_HIDDEN) // 16
+    exp_scales = (sum(int(d["out_dim"]) * (int(d["in_dim"]) // 32) for d in geom["linears"]) + GEMMA4_VOCAB * (GEMMA4_HIDDEN // 32))
+    m2 = re.search(
+        r"\bSLGB_VERIFY_PASS\s+flags=(\d+)\s+total_words=(\d+)\s+total_scales=(\d+)\s+secded_errors=0\b",
+        verify_stdout,
+    )
+    if not m2:
+        raise RuntimeError(f"Worker --verify output missing SLGB_VERIFY_PASS summary: {verify_stdout!r}")
+    if int(m2.group(1)) != 3:
+        raise RuntimeError(f"Worker --verify unexpected header flags={m2.group(1)} != 3")
+    if int(m2.group(2)) != exp_words:
+        raise RuntimeError(f"Worker --verify word count mismatch: {m2.group(2)} != {exp_words}")
+    if int(m2.group(3)) != exp_scales:
+        raise RuntimeError(f"Worker --verify scale count mismatch: {m2.group(3)} != {exp_scales}")
+
+
 def pack_safetensors_to_slgb(st_path: Path, slgb_out: Path) -> dict[str, Any]:
     """Stream google/gemma-4-E2B-it model.safetensors -> g=32 Form B .slgb in < 250 MiB RAM."""
     st_resolved = st_path.resolve()
+    file_size = st_resolved.stat().st_size
     with st_resolved.open("rb") as f:
         hlen = struct.unpack("<Q", f.read(8))[0]
-        hdr = json.loads(f.read(hlen).decode("utf-8"))
+        if hlen == 0 or hlen > 64 * 1024 * 1024 or (8 + hlen) > file_size:
+            raise ValueError(f"Invalid safetensors header length: {hlen}")
+        hdr = json.loads(
+            f.read(hlen).decode("utf-8", "strict"),
+            parse_constant=_reject_nonfinite,
+            object_pairs_hook=_reject_dup_keys,
+        )
     hdr.pop("__metadata__", None)
     data_base = 8 + int(hlen)
+    data_bytes_avail = file_size - data_base
 
     geom = build_gemma4_descriptor_geometry(32)
+    validate_safetensors_tensor_spans(hdr, geom, data_bytes_avail=data_bytes_avail)
     offsets = compute_slgb_section_offsets(WIRE_BYTES_G32, has_lm_shadow=True, has_u4=True)
     hdr_bytes = pack_slgb_header_and_descs(geom, flags=3)
 
@@ -304,18 +417,12 @@ def pack_safetensors_to_slgb(st_path: Path, slgb_out: Path) -> dict[str, Any]:
     for d in geom["linears"]:
         key = f"model.language_model.{d['name']}.weight"
         entry = hdr[key]
-        if entry["dtype"] != "BF16":
-            raise ValueError(f"Expected BF16 for {key}, got {entry['dtype']}")
-        if list(entry["shape"]) != [d["out_dim"], d["in_dim"]]:
-            raise ValueError(f"Shape mismatch for {key}: {entry['shape']}")
         in_off = data_base + int(entry["data_offsets"][0])
         out_w = offsets["off_p1_wire"] + int(d["words_byte_offset"])
         out_s = offsets["off_p1_wire"] + int(d["scales_byte_offset"])
         job_lines.append(f"LINEAR {d['out_dim']} {d['in_dim']} {in_off} {out_w} {out_s}")
 
     emb_entry = hdr["model.language_model.embed_tokens.weight"]
-    if emb_entry["dtype"] != "BF16" or list(emb_entry["shape"]) != [GEMMA4_VOCAB, GEMMA4_HIDDEN]:
-        raise ValueError("Unexpected embed_tokens shape/dtype")
     emb_in_off = data_base + int(emb_entry["data_offsets"][0])
     lm_w_off = offsets["off_p2_lm_shadow"]
     lm_s_off = offsets["off_p2_lm_shadow"] + 201326592
@@ -324,8 +431,6 @@ def pack_safetensors_to_slgb(st_path: Path, slgb_out: Path) -> dict[str, Any]:
     for ns in geom["norm_specs"]:
         key = f"model.language_model.{ns['key']}"
         entry = hdr[key]
-        if entry["dtype"] != "BF16":
-            raise ValueError(f"Expected BF16 norm {key}, got {entry['dtype']}")
         in_off = data_base + int(entry["data_offsets"][0])
         out_off = offsets["off_p3_norms"] + int(ns["offset"]) * 4
         job_lines.append(f"NORM {ns['count']} {in_off} {out_off}")
@@ -352,6 +457,7 @@ def pack_safetensors_to_slgb(st_path: Path, slgb_out: Path) -> dict[str, Any]:
             p2 = subprocess.run([str(worker), "--verify", str(tmp_slgb)], capture_output=True, text=True, check=False)
             if p2.returncode != 0:
                 raise RuntimeError(f"Worker --verify failed:\n{p2.stderr}\n{p2.stdout}")
+            _verify_worker_outputs(p1.stdout, p2.stdout)
         os.replace(tmp_slgb, slgb_out)
     finally:
         if tmp_slgb.exists():
@@ -378,6 +484,7 @@ def verify_slgb_file(slgb_path: Path) -> dict[str, Any]:
         proc = subprocess.run([str(worker), "--verify", str(slgb_path)], capture_output=True, text=True, check=False)
         if proc.returncode != 0:
             raise RuntimeError(f"Verify failed:\n{proc.stderr}\n{proc.stdout}")
+    _verify_worker_outputs(None, proc.stdout)
     return {"status": "VERIFY_PASS", "slgb_bytes": slgb_path.stat().st_size, "output": proc.stdout.strip()}
 
 
