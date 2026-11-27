@@ -1,7 +1,9 @@
 Upstream Base Model: google/gemma-4-E2B-it
 License: Apache License 2.0 (inherited from google/gemma-4-E2B-it)
 Upstream Model Card: https://huggingface.co/google/gemma-4-E2B-it
+Upstream License Notice: https://ai.google.dev/gemma/docs/gemma_4_license
 License Text: https://www.apache.org/licenses/LICENSE-2.0 (full copy in LICENSE)
-Target Hugging Face Release: https://huggingface.co/ahrazzle/SiliGemma-4-E2B-FormB-Native
+Flagship Hugging Face Release: https://huggingface.co/ahrazzle/SiliGemma-1.0
 Companion Form A Drop-In Release: https://huggingface.co/ahrazzle/SiliGemma-4-E2B-FormA
+Companion Form B Stage-1 Release: https://huggingface.co/ahrazzle/SiliGemma-4-E2B-FormB-Native
 Companion Source Repository: https://github.com/Moissanite-Labs/siligemma

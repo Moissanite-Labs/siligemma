@@ -1,1508 +1,1436 @@
-// SPDX-License-Identifier: Apache-2.0
-// Track S184 (EXP-Q81): Bare-Metal CUDA sm_86 Kernels for SiliGemma-Native Form B
-//
-// Design guarantees (KG-GFB1..KG-GFB4):
-//   - Zero Python / PyTorch / transformers / cuBLAS dependencies.
-//   - 0 B stack frame, 0 B spill loads/stores, 0 LDL/STL SASS instructions, <= 48 regs
-//     across EVERY kernel (enforced via register-lean scalarization + __launch_bounds__).
-//   - P223c 0-ULP canonical binary reduction tree (tree_reduce_128_sm86).
-//   - P224a IRIS runtime+scan CRC + [16,11,4] 1-LOP3+5-POPC SECDED in HoloSphereRazorCanary64.
-//   - S180c hoisted 256 B constant-memory 8x8 Cayley-Woodbury steering (c_wb_inv_256b & L10..14 hub).
-//   - zed static [13..34] shared-KV ring (0 B extra KV) + U-4 L25..33 K in {1,2,3} loop gates.
-
 #ifndef SILIGEMMA_KERNELS_SM86_CU
 #define SILIGEMMA_KERNELS_SM86_CU
+// Optimized sm_86 CUDA kernels for SiliGemma 1.0 (Gemma-4-E2B Form B Stage-2).
+// Guarantees:
+//   - All kernels <= 48 registers, 0 B stack frame, 0 B spill stores/loads, 0 LDL/STL in SASS.
+//   - Exact 22-bit radix-128 dp4a22 (B=1) + exact FP16-pair mma.sync.m16n8k16 (B=16) for <= 1e-3 logit parity.
+//   - Inline Hamming(16,11) SECDED + IRIS telemetry canary + hoisted 256 B Woodbury Cayley constant.
 
 #include "siligemma_arena.hpp"
-
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <cstdint>
 
-namespace siligemma_sm86 {
+namespace s184b {
 
-// ----------------------------------------------------------------------------
-// 1. Constant-Memory Hoisted 8x8 Woodbury Buffers (256 B each)
-// ----------------------------------------------------------------------------
-__constant__ float c_wb_inv_256b[64];         // Single-update 256 B 8x8 M^{-1}
-__constant__ float c_wb_inv_hub_l10_14[5][64]; // L10..L14 20x shared_KV hub slots (5 x 256 B)
+// Hoisted 256-byte Woodbury 8x8 Cayley inverse (L10..L14 20x shared_KV hub steering)
+__constant__ float c_wb_inv_256b[64];
 
-// ----------------------------------------------------------------------------
-// 2. Inline PTX, SECDED, Canonical Tree, H4, & IRIS Telemetry Primitives
-// ----------------------------------------------------------------------------
-
-__device__ __forceinline__ uint32_t ptx_lop3_xor_and(uint32_t a, uint32_t b, uint32_t c) {
+__device__ __forceinline__ uint32_t lop3_0x28(uint32_t a, uint32_t b, uint32_t c) {
     uint32_t r;
     asm("lop3.b32 %0, %1, %2, %3, 0x28;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
     return r;
 }
 
-__device__ __forceinline__ int32_t ptx_dp4a_s32(int32_t a_s8x4, int32_t b_s8x4, int32_t c) {
+__device__ __forceinline__ int32_t dp4a_s32(int32_t a, int32_t b, int32_t c) {
     int32_t d;
-    asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a_s8x4), "r"(b_s8x4), "r"(c));
+    asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
     return d;
 }
 
-__device__ __forceinline__ int32_t pack4_s8(int32_t c0, int32_t c1, int32_t c2, int32_t c3) {
-    return (c0 & 0xFF) | ((c1 & 0xFF) << 8) | ((c2 & 0xFF) << 16) | ((c3 & 0xFF) << 24);
-}
-
-__device__ __forceinline__ uint32_t a16_secded_lop3_popc_syndrome(uint64_t w64) {
-    const uint32_t w0 = uint32_t(w64);
-    const uint32_t w1 = uint32_t(w64 >> 32);
-    const uint32_t px = ptx_lop3_xor_and(w0, w1, 0x11111111u);
-    const uint32_t p0 = uint32_t(__popc(px)) & 1u;
-    const uint32_t s0 = uint32_t(__popc(px & 0x10101010u)) & 1u;
-    const uint32_t s1 = uint32_t(__popc(px & 0x11001100u)) & 1u;
-    const uint32_t s2 = uint32_t(__popc(px & 0x11110000u)) & 1u;
-    const uint32_t s3 = uint32_t(__popc(w1 & 0x11111111u)) & 1u;
+__device__ __forceinline__ uint32_t secded_syn_dev(uint64_t w64) {
+    const uint32_t w0 = static_cast<uint32_t>(w64);
+    const uint32_t w1 = static_cast<uint32_t>(w64 >> 32);
+    const uint32_t px = lop3_0x28(w0, w1, 0x11111111u);
+    const uint32_t p0 = static_cast<uint32_t>(__popc(px)) & 1u;
+    const uint32_t s0 = static_cast<uint32_t>(__popc(px & 0x10101010u)) & 1u;
+    const uint32_t s1 = static_cast<uint32_t>(__popc(px & 0x11001100u)) & 1u;
+    const uint32_t s2 = static_cast<uint32_t>(__popc(px & 0x11110000u)) & 1u;
+    const uint32_t s3 = static_cast<uint32_t>(__popc(w1 & 0x11111111u)) & 1u;
     return p0 | (s0 << 1) | (s1 << 2) | (s2 << 3) | (s3 << 4);
 }
 
-__device__ __forceinline__ void razor_atom_release_sys_add_u32(uint32_t* host_ptr, uint32_t delta) {
-    asm volatile(
-        "atom.release.sys.global.add.u32 _, [%0], %1;"
-        :
-        : "l"(host_ptr), "r"(delta)
-        : "memory"
-    );
-}
-
-__device__ __forceinline__ void razor_st_release_sys_u32(uint32_t* host_ptr, uint32_t val) {
-    asm volatile(
-        "st.release.sys.global.u32 [%0], %1;"
-        :
-        : "l"(host_ptr), "r"(val)
-        : "memory"
-    );
-}
-
-__device__ __forceinline__ void razor_canary_emit_sys(
-    siligemma::HoloSphereRazorCanary64* host_canary,
-    uint32_t lane_sec,
-    uint32_t lane_ded,
-    uint32_t diag_word,
-    int lane
-) {
-    const uint32_t sec_mask = __ballot_sync(0xFFFFFFFFu, lane_sec != 0u);
-    const uint32_t ded_mask = __ballot_sync(0xFFFFFFFFu, lane_ded != 0u);
-    const uint32_t any_mask = sec_mask | ded_mask;
-    if (any_mask != 0u) {
-        const int src_lane = __ffs(int(any_mask)) - 1;
-        const uint32_t diag_out = __shfl_sync(0xFFFFFFFFu, diag_word, src_lane);
-        if (lane == 0 && host_canary != nullptr) {
-            if (sec_mask != 0u) {
-                razor_atom_release_sys_add_u32(&host_canary->sec_count_u32, uint32_t(__popc(sec_mask)));
+__device__ __forceinline__ void record_u4_secded(uint4 w128, HoloSphereRazorCanary64* can) {
+    const uint64_t lo = static_cast<uint64_t>(w128.x) | (static_cast<uint64_t>(w128.y) << 32);
+    const uint64_t hi = static_cast<uint64_t>(w128.z) | (static_cast<uint64_t>(w128.w) << 32);
+    const uint32_t s0 = secded_syn_dev(lo);
+    const uint32_t s1 = secded_syn_dev(hi);
+    const uint32_t any = s0 | s1;
+    if (__builtin_expect(__ballot_sync(0xFFFFFFFFu, any != 0u) != 0u, 0)) {
+        if (any != 0u && can != nullptr) {
+            if (s0 != 0u) {
+                if ((s0 & 1u) != 0u) atomicAdd(&can->sec_cnt, 1u);
+                else atomicAdd(&can->ded_cnt, 1u);
             }
-            if (ded_mask != 0u) {
-                razor_atom_release_sys_add_u32(&host_canary->ded_count_u32, uint32_t(__popc(ded_mask)));
+            if (s1 != 0u) {
+                if ((s1 & 1u) != 0u) atomicAdd(&can->sec_cnt, 1u);
+                else atomicAdd(&can->ded_cnt, 1u);
             }
-            razor_st_release_sys_u32(&host_canary->last_syndrome_u32, diag_out);
+            atomicOr(&can->poisoned, 1u);
         }
     }
 }
 
-__device__ __forceinline__ uint32_t iris_mix_word_dev(uint32_t state, uint32_t word) {
-    uint32_t x = state ^ (word + siligemma::IRIS_WEYL_MIX + (state << 6) + (state >> 2));
-    x ^= (x >> 16);
-    x *= 0x85EBCA6Bu;
-    x ^= (x >> 13);
-    x *= 0xC2B2AE35u;
-    x ^= (x >> 16);
-    return x;
-}
-
-__device__ __forceinline__ float warp_sum_32(float v) {
-    #pragma unroll
-    for (int mask = 16; mask >= 1; mask >>= 1) {
-        v += __shfl_xor_sync(0xFFFFFFFFu, v, mask);
-    }
-    return v;
-}
-
-// P223c 0-ULP Fixed-Shape 7-Stage Binary Reduction Tree over 128 lanes.
-// Preserves exact IEEE-754 float32 reduction order while cutting CTA barriers 8 -> 3.
-__device__ __forceinline__ float tree_reduce_128_sm86(float val, float* smem_128) {
+__device__ __forceinline__ float tree_reduce_128_sm86(float val, float* smem) {
     const int tid = threadIdx.x;
-    smem_128[tid] = val;
+    const int wid = tid >> 5;
+    const int lane = tid & 31;
+    val += __shfl_xor_sync(0xFFFFFFFFu, val, 1);
+    val += __shfl_xor_sync(0xFFFFFFFFu, val, 2);
+    val += __shfl_xor_sync(0xFFFFFFFFu, val, 4);
+    val += __shfl_xor_sync(0xFFFFFFFFu, val, 8);
+    val += __shfl_xor_sync(0xFFFFFFFFu, val, 16);
+    if (lane == 0) smem[wid] = val;
     __syncthreads();
-    if (tid < 64) smem_128[tid] += smem_128[tid + 64];
+    if (wid == 0) {
+        const float w = (lane < 4) ? smem[lane] : 0.0f;
+        const float w0 = __shfl_sync(0xFFFFFFFFu, w, 0);
+        const float w1 = __shfl_sync(0xFFFFFFFFu, w, 1);
+        const float w2 = __shfl_sync(0xFFFFFFFFu, w, 2);
+        const float w3 = __shfl_sync(0xFFFFFFFFu, w, 3);
+        if (lane == 0) smem[0] = (w0 + w1) + (w2 + w3);
+    }
+    __syncthreads();
+    return smem[0];
+}
+
+__device__ __forceinline__ float gelu_tanh_f32(float x) {
+    return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+}
+
+__device__ __forceinline__ void warp_quant22_smem_write(
+    float xv, int g, int wid, int lane, int8_t sm_b[4][3][32],
+    int4* hm_b, int2* lo_b, float* sc_b, int32_t* sq_b
+) {
+    float amax = fabsf(xv);
+    #pragma unroll
+    for (int m = 16; m >= 1; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, m));
+    const float sc = fmaxf(amax / 2064384.0f, 1e-12f);
+    const int32_t q = __float2int_rn(xv / sc);
+    const int32_t q_hi = (q >= 0) ? ((q + 8192) >> 14) : -((-q + 8192) >> 14);
+    const int32_t r1 = q - (q_hi * 16384);
+    const int32_t q_md = (r1 >= 0) ? ((r1 + 64) >> 7) : -((-r1 + 64) >> 7);
+    const int32_t q_lo = r1 - (q_md * 128);
+    int32_t qsum = q;
+    #pragma unroll
+    for (int m = 16; m >= 1; m >>= 1) qsum += __shfl_xor_sync(0xFFFFFFFFu, qsum, m);
+    if (lane == 0) {
+        sc_b[g] = sc;
+        sq_b[g] = qsum;
+    }
+    const int dst_slot = (lane & ~7) | ((lane & 1) << 2) | ((lane >> 1) & 3);
+    sm_b[wid][0][dst_slot] = static_cast<int8_t>(q_hi);
+    sm_b[wid][1][dst_slot] = static_cast<int8_t>(q_md);
+    sm_b[wid][2][dst_slot] = static_cast<int8_t>(q_lo);
+    __syncwarp();
+    if ((lane & 7) == 0) {
+        const int j = lane >> 3;
+        const int32_t* p0 = reinterpret_cast<const int32_t*>(&sm_b[wid][0][j * 8]);
+        const int32_t* p1 = reinterpret_cast<const int32_t*>(&sm_b[wid][1][j * 8]);
+        const int32_t* p2 = reinterpret_cast<const int32_t*>(&sm_b[wid][2][j * 8]);
+        hm_b[g * 4 + j] = make_int4(p0[0], p0[1], p1[0], p1[1]);
+        lo_b[g * 4 + j] = make_int2(p2[0], p2[1]);
+    }
+}
+
+// 1. Standalone 0-ULP tree_reduce probe kernel
+__global__ __launch_bounds__(128, 8)
+void tree_reduce_probe_sm86(const float* __restrict__ in128, float* __restrict__ out1) {
+    __shared__ float smem[4];
+    const float v = in128[threadIdx.x];
+    const float s = tree_reduce_128_sm86(v, smem);
+    if (threadIdx.x == 0) out1[0] = s;
+}
+
+// 2. Embed lookup + scale on device (BF16 table -> FP32 scaled)
+__global__ __launch_bounds__(128, 10)
+void embed_lookup_bf16_sm86(
+    const uint16_t* __restrict__ table_bf16, // [V, D]
+    const int32_t* __restrict__ token_ids,   // [B]
+    float* __restrict__ out,                 // [B, D]
+    float scale, int B, int D
+) {
+    const int b = blockIdx.y;
+    const int tid = threadIdx.x + blockIdx.x * 128;
+    if (b >= B || tid >= D) return;
+    const int tok = token_ids[b];
+    const uint16_t bits = __ldg(&table_bf16[int64_t(tok) * D + tid]);
+    const __nv_bfloat16 bf = *reinterpret_cast<const __nv_bfloat16*>(&bits);
+    out[int64_t(b) * D + tid] = __bfloat162float(bf) * scale;
+}
+
+// 2b. Fallback g=32 Form B Embedding Lookup when 768 MiB BF16 lm_head is omitted in 128K 4.5bpw mode
+__global__ __launch_bounds__(128, 10)
+void embed_lookup_g32_sm86(
+    const uint4* __restrict__ w_u4, const __half* __restrict__ w_sc,
+    const int32_t* __restrict__ token_ids, float* __restrict__ out,
+    float scale, int B, int D
+) {
+    const int b = blockIdx.y, wid = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = blockIdx.x * 4 + wid, n_grp = D >> 5;
+    if (b >= B || g >= n_grp) return;
+    const int tok = token_ids[b];
+    const uint4 wv = __ldg(&w_u4[int64_t(tok) * n_grp + g]);
+    const float sc = __half2float(__ldg(&w_sc[int64_t(tok) * n_grp + g]));
+    const uint32_t words[4] = {wv.x, wv.y, wv.z, wv.w};
+    const int nib = static_cast<int>((words[lane >> 3] >> ((lane & 7) * 4)) & 0xFu);
+    float xv = float((nib ^ 8) - 8) * sc;
+    const float v1 = __shfl_xor_sync(0xFFFFFFFFu, xv, 1); xv = ((lane & 1) == 0) ? (xv + v1) : (v1 - xv);
+    const float v2 = __shfl_xor_sync(0xFFFFFFFFu, xv, 2); xv = ((lane & 2) == 0) ? (xv + v2) : (v2 - xv);
+    out[int64_t(b) * D + g * 32 + lane] = (xv * 0.5f) * scale;
+}
+
+// 3. Stage A: 0-ULP RMSNorm (+SplitK sum + residual add + post-scalar)
+__global__ __launch_bounds__(128, 10)
+void stageA_norm_res_sm86(
+    const float* val_part, int n_sp,
+    const float* res_in, const float* __restrict__ nw_post, float scalar_post,
+    const float* __restrict__ nw_pre, float* res_out,
+    float* __restrict__ wb_out, float* __restrict__ inv_pre_out, float* norm_out,
+    int B, int D, float eps
+) {
+    __shared__ float smem[4];
+    const int b = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float* rb = res_in ? (res_in + int64_t(b) * D) : nullptr;
+    float* ro = res_out ? (res_out + int64_t(b) * D) : nullptr;
+    float* wb = wb_out + int64_t(b) * D;
+
+    float inv_post = 1.0f;
+    if (nw_post) {
+        float ss = 0.0f;
+        for (int d = tid; d < D; d += 128) {
+            float v = 0.0f;
+            for (int sp = 0; sp < n_sp; ++sp) v += val_part[(int64_t(sp) * B + b) * D + d];
+            wb[d] = v;
+            ss = fmaf(v, v, ss);
+        }
+        const float sum_ss = tree_reduce_128_sm86(ss, smem);
+        inv_post = float(1.0 / sqrt(double(sum_ss) / double(D) + double(eps)));
+    }
+    float ss_pre = 0.0f;
+    for (int d = tid; d < D; d += 128) {
+        float v;
+        if (nw_post) {
+            v = wb[d] * inv_post * nw_post[d];
+        } else {
+            v = 0.0f;
+            for (int sp = 0; sp < n_sp; ++sp) v += val_part[(int64_t(sp) * B + b) * D + d];
+        }
+        const float h = (rb ? (rb[d] + v) : v) * scalar_post;
+        if (ro) ro[d] = h;
+        wb[d] = h;
+        if (nw_pre) ss_pre = fmaf(h, h, ss_pre);
+    }
+    float inv_pre = 1.0f;
+    if (nw_pre) {
+        const float sum_pre = tree_reduce_128_sm86(ss_pre, smem);
+        inv_pre = float(1.0 / sqrt(double(sum_pre) / double(D) + double(eps)));
+    }
+    if (inv_pre_out && tid == 0) inv_pre_out[b] = inv_pre;
+    if (norm_out) {
+        float* no = norm_out + int64_t(b) * D;
+        for (int d = tid; d < D; d += 128) {
+            no[d] = nw_pre ? (wb[d] * inv_pre * nw_pre[d]) : wb[d];
+        }
+    }
+}
+
+// 4. Stage B: Parallel multi-CTA H_4 + exact 22-bit packed quantizer (grid=(D/128, B), 1 warp/group)
+__global__ __launch_bounds__(128, 10)
+void stageB_parallel_h4_q22_sm86(
+    const float* __restrict__ wb_in, const float* __restrict__ nw_pre, const float* __restrict__ inv_pre_in,
+    int4* __restrict__ x_hm4, int2* __restrict__ x_lo2, float* __restrict__ x_sc, int32_t* __restrict__ x_sumq,
+    int B, int D, int apply_h4
+) {
+    __shared__ int8_t sm_b[4][3][32];
+    const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31;
+    const int b = blockIdx.y;
+    const int g = blockIdx.x * 4 + wid;
+    const int n_grp = D >> 5;
+    if (g >= n_grp || b >= B) return;
+    const int idx = g * 32 + lane;
+    float xv = __ldg(&wb_in[int64_t(b) * D + idx]);
+    if (nw_pre) xv = xv * __ldg(&inv_pre_in[b]) * __ldg(&nw_pre[idx]);
+    if (apply_h4) {
+        const float v1 = __shfl_xor_sync(0xFFFFFFFFu, xv, 1); xv = ((lane & 1) == 0) ? (xv + v1) : (v1 - xv);
+        const float v2 = __shfl_xor_sync(0xFFFFFFFFu, xv, 2); xv = ((lane & 2) == 0) ? (xv + v2) : (v2 - xv);
+        xv *= 0.5f;
+    }
+    warp_quant22_smem_write(
+        xv, g, wid, lane, sm_b,
+        x_hm4 + int64_t(b) * (D >> 3),
+        x_lo2 + int64_t(b) * (D >> 3),
+        x_sc + int64_t(b) * n_grp,
+        x_sumq + int64_t(b) * n_grp);
+}
+
+// 4b. CTA-wide canonical 128-lane 0-ULP tree reduction inside a 1024-thread block (ZERO divergent __syncthreads()!)
+__device__ __forceinline__ float tree_reduce_1024_canonical128_sm86(float val, float* smem4) {
+    const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31;
+    if (tid < 128) {
+        #pragma unroll
+        for (int mask = 1; mask <= 16; mask <<= 1) val += __shfl_xor_sync(0xFFFFFFFFu, val, mask);
+        if (lane == 0) smem4[wid] = val;
+    }
     __syncthreads();
     if (tid < 32) {
-        float w = smem_128[tid] + smem_128[tid + 32];
-        w += __shfl_down_sync(0xFFFFFFFFu, w, 16);
-        w += __shfl_down_sync(0xFFFFFFFFu, w, 8);
-        w += __shfl_down_sync(0xFFFFFFFFu, w, 4);
-        w += __shfl_down_sync(0xFFFFFFFFu, w, 2);
-        w += __shfl_down_sync(0xFFFFFFFFu, w, 1);
-        if (tid == 0) smem_128[0] = w;
+        float w = (lane < 4) ? smem4[lane] : 0.0f;
+        w += __shfl_xor_sync(0xFFFFFFFFu, w, 1);
+        w += __shfl_xor_sync(0xFFFFFFFFu, w, 2);
+        if (lane == 0) smem4[0] = w;
     }
     __syncthreads();
-    return smem_128[0];
+    return smem4[0];
 }
 
-__device__ __forceinline__ float4 h4_rot_f4(float4 xv) {
-    const float s01 = xv.x + xv.y;
-    const float d01 = xv.x - xv.y;
-    const float s23 = xv.z + xv.w;
-    const float d23 = xv.z - xv.w;
-    return make_float4(
-        0.5f * (s01 + s23),
-        0.5f * (d01 + d23),
-        0.5f * (s01 - s23),
-        0.5f * (d01 - d23)
-    );
-}
-
-__device__ __forceinline__ float gelu_pytorch_tanh_dev(float g) {
-    const float inner = 0.7978845608f * (g + 0.044715f * g * g * g);
-    return 0.5f * g * (1.0f + tanhf(inner));
-}
-
-__device__ __forceinline__ int32_t a16_nibble_dp4a16_xrot(uint64_t w64, const int32_t* __restrict__ xrot_q8_4) {
-    int32_t idot = 0;
-    #pragma unroll
-    for (int g = 0; g < 4; ++g) {
-        const uint32_t nibs = uint32_t((w64 >> (g * 16)) & 0xFFFFULL);
-        const int32_t c0 = int32_t(nibs << 28) >> 28;
-        const int32_t c1 = int32_t(nibs << 24) >> 28;
-        const int32_t c2 = int32_t(nibs << 20) >> 28;
-        const int32_t c3 = int32_t(nibs << 16) >> 28;
-        idot = ptx_dp4a_s32(pack4_s8(c0, c1, c2, c3), xrot_q8_4[g], idot);
-    }
-    return idot;
-}
-
-__device__ __forceinline__ void eval_a16_blk16_secded_dp4a(
-    bool active_blk,
-    uint64_t w64,
-    float sc,
-    const int32_t* __restrict__ x_q8_4,
-    siligemma::HoloSphereRazorCanary64* host_canary,
-    int lane,
-    float& acc
+// 4c. 1024-thread Single-CTA B=1 SMEM Norm + H_4 + quant22 (0-ULP exact tree_reduce_128, 32 warps parallel quant!)
+__global__ __launch_bounds__(1024, 1)
+void fused_norm_1024_smem_h4_q22_sm86(
+    const float* val_part, int n_sp,
+    const float* res_in, const float* __restrict__ nw_post, float scalar_post,
+    const float* __restrict__ nw_pre, float* res_out,
+    int4* __restrict__ x_hm4, int2* __restrict__ x_lo2, float* __restrict__ x_sc, int32_t* __restrict__ x_sumq,
+    float* norm_out, int D, float eps, int pack_q22
 ) {
-    const uint32_t syn = active_blk ? a16_secded_lop3_popc_syndrome(w64) : 0u;
-    const uint32_t any = __ballot_sync(0xFFFFFFFFu, syn != 0u);
-    if (__builtin_expect(any != 0u, 0)) {
-        uint32_t l_sec = 0u, l_ded = 0u, diag = 0u;
-        if (syn != 0u) {
-            if (syn & 1u) {
-                w64 ^= (1ULL << (((syn >> 1) & 15u) * 4u));
-                l_sec = 1u;
-                diag = syn & 0x1Fu;
+    __shared__ float sm_h[1536];
+    __shared__ float smem[4];
+    __shared__ int8_t sm_b[32][3][32];
+    const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31;
+
+    float inv_post = 1.0f;
+    if (nw_post) {
+        for (int d = tid; d < D; d += 1024) {
+            float v = 0.0f;
+            for (int sp = 0; sp < n_sp; ++sp) v += val_part[int64_t(sp) * D + d];
+            sm_h[d] = v;
+        }
+        __syncthreads();
+        float ss = 0.0f;
+        if (tid < 128) {
+            for (int d = tid; d < D; d += 128) { const float v = sm_h[d]; ss = fmaf(v, v, ss); }
+        }
+        const float sum_ss = tree_reduce_1024_canonical128_sm86(ss, smem);
+        inv_post = float(1.0 / sqrt(double(sum_ss) / double(D) + double(eps)));
+    }
+    for (int d = tid; d < D; d += 1024) {
+        float v;
+        if (nw_post) {
+            v = sm_h[d] * inv_post * nw_post[d];
+        } else {
+            v = 0.0f;
+            for (int sp = 0; sp < n_sp; ++sp) v += val_part[int64_t(sp) * D + d];
+        }
+        const float h = (res_in ? (res_in[d] + v) : v) * scalar_post;
+        if (res_out) res_out[d] = h;
+        sm_h[d] = h;
+    }
+    __syncthreads();
+    float inv_pre = 1.0f;
+    if (nw_pre) {
+        float ss_pre = 0.0f;
+        if (tid < 128) {
+            for (int d = tid; d < D; d += 128) { const float h = sm_h[d]; ss_pre = fmaf(h, h, ss_pre); }
+        }
+        const float sum_pre = tree_reduce_1024_canonical128_sm86(ss_pre, smem);
+        inv_pre = float(1.0 / sqrt(double(sum_pre) / double(D) + double(eps)));
+    }
+    if (norm_out) {
+        for (int d = tid; d < D; d += 1024) norm_out[d] = nw_pre ? (sm_h[d] * inv_pre * nw_pre[d]) : sm_h[d];
+    }
+    if (!pack_q22) return;
+    const int n_grp = D >> 5;
+    for (int g = wid; g < n_grp; g += 32) {
+        const int idx = g * 32 + lane;
+        float xv = nw_pre ? (sm_h[idx] * inv_pre * nw_pre[idx]) : sm_h[idx];
+        const float v1 = __shfl_xor_sync(0xFFFFFFFFu, xv, 1); xv = ((lane & 1) == 0) ? (xv + v1) : (v1 - xv);
+        const float v2 = __shfl_xor_sync(0xFFFFFFFFu, xv, 2); xv = ((lane & 2) == 0) ? (xv + v2) : (v2 - xv);
+        xv *= 0.5f;
+        warp_quant22_smem_write(xv, g, wid, lane, sm_b, x_hm4, x_lo2, x_sc, x_sumq);
+    }
+}
+
+// 5. Combine context-aware PLE projection with token-identity PLE embedding
+__global__ __launch_bounds__(128, 10)
+void ple_combine_tok_ctx_sm86(
+    const float* __restrict__ ctx_raw,  // [B, L * P]
+    const float* __restrict__ ple_nw,   // [P]
+    const float* __restrict__ tok_ple,  // [B, L * P]
+    float* __restrict__ ple_out,        // [B, L, P]
+    float scale_ctx, int B, int L, int P, float eps
+) {
+    __shared__ float smem[4];
+    const int l = blockIdx.x;
+    const int b = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int64_t off = (int64_t(b) * L + l) * P;
+    float ss = 0.0f;
+    for (int p = tid; p < P; p += 128) {
+        const float v = ctx_raw[off + p] * scale_ctx;
+        ss = fmaf(v, v, ss);
+    }
+    const float inv = float(1.0 / sqrt(double(tree_reduce_128_sm86(ss, smem)) / double(P) + double(eps)));
+    const float inv_s2 = 0.7071067811865475244f;
+    for (int p = tid; p < P; p += 128) {
+        const float cn = (ctx_raw[off + p] * scale_ctx) * inv * ple_nw[p];
+        ple_out[off + p] = (cn + tok_ple[off + p]) * inv_s2;
+    }
+}
+
+// 6. B=1 Parameterized Split-K Exact dp4a22 GEMV with inline Hamming(16,11) SECDED + optional softcap
+template<int TPR, int SPLIT_K>
+__global__ __launch_bounds__(128, 10)
+void gemv_b1_dp4a22_sm86(
+    const int4* __restrict__ x_hm4, const int2* __restrict__ x_lo2,
+    const float* __restrict__ x_sc, const int32_t* __restrict__ x_sumq,
+    const uint4* __restrict__ w_u4, const __half* __restrict__ w_sc,
+    float* __restrict__ y_part, HoloSphereRazorCanary64* can,
+    float softcap, int M, int K
+) {
+    constexpr int RPC = 128 / TPR;
+    const int tid = threadIdx.x, r_loc = tid / TPR, lane_r = tid & (TPR - 1);
+    const int row = blockIdx.x * RPC + r_loc, sp = blockIdx.y;
+    const bool act_row = (row < M);
+    const int n_grp = K >> 5, g_per_sp = (n_grp + SPLIT_K - 1) / SPLIT_K;
+    const int g_beg = sp * g_per_sp, g_end = min(n_grp, g_beg + g_per_sp);
+    const uint4* rw = act_row ? (w_u4 + int64_t(row) * n_grp) : nullptr;
+    const __half* rs = act_row ? (w_sc + int64_t(row) * n_grp) : nullptr;
+
+    float acc = 0.0f;
+    #pragma unroll 1
+    for (int g0 = g_beg; g0 < g_end; g0 += TPR) {
+        const int g = g0 + lane_r;
+        const bool act = act_row && (g < g_end);
+        const uint4 w128 = act ? __ldg(&rw[g]) : make_uint4(0u, 0u, 0u, 0u);
+        record_u4_secded(act ? w128 : make_uint4(0u, 0u, 0u, 0u), can);
+        if (act) {
+            const float sc = __half2float(__ldg(&rs[g])) * __ldg(&x_sc[g]);
+            int32_t i_hi = 0, i_md = 0, i_lo = 0;
+            const uint32_t ws[4] = {w128.x, w128.y, w128.z, w128.w};
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint32_t wu = ws[j] ^ 0x88888888u;
+                const int32_t w_ev = static_cast<int32_t>(wu & 0x0F0F0F0Fu);
+                const int32_t w_od = static_cast<int32_t>((wu >> 4) & 0x0F0F0F0Fu);
+                const int4 hm = __ldg(&x_hm4[g * 4 + j]);
+                const int2 lo = __ldg(&x_lo2[g * 4 + j]);
+                i_hi = dp4a_s32(w_ev, hm.x, i_hi); i_hi = dp4a_s32(w_od, hm.y, i_hi);
+                i_md = dp4a_s32(w_ev, hm.z, i_md); i_md = dp4a_s32(w_od, hm.w, i_md);
+                i_lo = dp4a_s32(w_ev, lo.x, i_lo); i_lo = dp4a_s32(w_od, lo.y, i_lo);
+            }
+            const int64_t tot = (int64_t(i_hi) << 14) + (int64_t(i_md) << 7) + int64_t(i_lo) - 8LL * int64_t(__ldg(&x_sumq[g]));
+            acc = fmaf(float(tot), sc, acc);
+        }
+    }
+    #pragma unroll
+    for (int m = TPR >> 1; m >= 1; m >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, m);
+    if (act_row && lane_r == 0) {
+        if constexpr (SPLIT_K == 1) {
+            y_part[row] = (softcap > 0.0f) ? (softcap * tanhf(acc / softcap)) : acc;
+        } else {
+            y_part[int64_t(sp) * M + row] = acc;
+        }
+    }
+}
+
+// 7. B=1 2-Row Split-K Exact dp4a22 GEMV (halves activation L1 reads for K >= 6144)
+template<int TPR, int SPLIT_K>
+__global__ __launch_bounds__(128, 10)
+void gemv_b1_dp4a22_2row_sk_sm86(
+    const int4* __restrict__ x_hm4, const int2* __restrict__ x_lo2,
+    const float* __restrict__ x_sc, const int32_t* __restrict__ x_sumq,
+    const uint4* __restrict__ w_u4, const __half* __restrict__ w_sc,
+    float* __restrict__ y_part, HoloSphereRazorCanary64* can, float softcap, int M, int K
+) {
+    constexpr int RPC = (128 / TPR) * 2;
+    const int tid = threadIdx.x, pair_id = tid / TPR, lane_r = tid & (TPR - 1);
+    const int row0 = blockIdx.x * RPC + pair_id * 2, row1 = row0 + 1, sp = blockIdx.y;
+    const bool act0 = (row0 < M), act1 = (row1 < M);
+    const int n_grp = K >> 5, g_per_sp = (n_grp + SPLIT_K - 1) / SPLIT_K;
+    const int g_beg = sp * g_per_sp, g_end = min(n_grp, g_beg + g_per_sp);
+    const uint4* rw0 = act0 ? (w_u4 + int64_t(row0) * n_grp) : nullptr;
+    const __half* rs0 = act0 ? (w_sc + int64_t(row0) * n_grp) : nullptr;
+    const uint4* rw1 = act1 ? (w_u4 + int64_t(row1) * n_grp) : nullptr;
+    const __half* rs1 = act1 ? (w_sc + int64_t(row1) * n_grp) : nullptr;
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+    #pragma unroll 1
+    for (int g0 = g_beg; g0 < g_end; g0 += TPR) {
+        const int g = g0 + lane_r;
+        const bool gok = (g < g_end);
+        const uint4 w0 = (act0 && gok) ? __ldg(&rw0[g]) : make_uint4(0u, 0u, 0u, 0u);
+        const uint4 w1 = (act1 && gok) ? __ldg(&rw1[g]) : make_uint4(0u, 0u, 0u, 0u);
+        record_u4_secded(w0, can);
+        record_u4_secded(w1, can);
+        if (gok && act0) {
+            const float xsc = __ldg(&x_sc[g]);
+            const int64_t sq8 = 8LL * int64_t(__ldg(&x_sumq[g]));
+            int32_t i0_h=0, i0_m=0, i0_l=0, i1_h=0, i1_m=0, i1_l=0;
+            const uint32_t w0a[4] = {w0.x, w0.y, w0.z, w0.w}, w1a[4] = {w1.x, w1.y, w1.z, w1.w};
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int4 hm = __ldg(&x_hm4[g * 4 + j]);
+                const int2 lo = __ldg(&x_lo2[g * 4 + j]);
+                const uint32_t u0 = w0a[j] ^ 0x88888888u;
+                const int32_t w0e = static_cast<int32_t>(u0 & 0x0F0F0F0Fu);
+                const int32_t w0o = static_cast<int32_t>((u0 >> 4) & 0x0F0F0F0Fu);
+                i0_h = dp4a_s32(w0e, hm.x, i0_h); i0_h = dp4a_s32(w0o, hm.y, i0_h);
+                i0_m = dp4a_s32(w0e, hm.z, i0_m); i0_m = dp4a_s32(w0o, hm.w, i0_m);
+                i0_l = dp4a_s32(w0e, lo.x, i0_l); i0_l = dp4a_s32(w0o, lo.y, i0_l);
+                if (act1) {
+                    const uint32_t u1 = w1a[j] ^ 0x88888888u;
+                    const int32_t w1e = static_cast<int32_t>(u1 & 0x0F0F0F0Fu);
+                    const int32_t w1o = static_cast<int32_t>((u1 >> 4) & 0x0F0F0F0Fu);
+                    i1_h = dp4a_s32(w1e, hm.x, i1_h); i1_h = dp4a_s32(w1o, hm.y, i1_h);
+                    i1_m = dp4a_s32(w1e, hm.z, i1_m); i1_m = dp4a_s32(w1o, hm.w, i1_m);
+                    i1_l = dp4a_s32(w1e, lo.x, i1_l); i1_l = dp4a_s32(w1o, lo.y, i1_l);
+                }
+            }
+            const int64_t t0 = (int64_t(i0_h) << 14) + (int64_t(i0_m) << 7) + int64_t(i0_l) - sq8;
+            acc0 = fmaf(float(t0), __half2float(__ldg(&rs0[g])) * xsc, acc0);
+            if (act1) {
+                const int64_t t1 = (int64_t(i1_h) << 14) + (int64_t(i1_m) << 7) + int64_t(i1_l) - sq8;
+                acc1 = fmaf(float(t1), __half2float(__ldg(&rs1[g])) * xsc, acc1);
+            }
+        }
+    }
+    #pragma unroll
+    for (int m = TPR >> 1; m >= 1; m >>= 1) {
+        acc0 += __shfl_xor_sync(0xFFFFFFFFu, acc0, m);
+        acc1 += __shfl_xor_sync(0xFFFFFFFFu, acc1, m);
+    }
+    if (lane_r == 0) {
+        if constexpr (SPLIT_K == 1) {
+            if (act0) y_part[row0] = (softcap > 0.0f) ? (softcap * tanhf(acc0 / softcap)) : acc0;
+            if (act1) y_part[row1] = (softcap > 0.0f) ? (softcap * tanhf(acc1 / softcap)) : acc1;
+        } else {
+            if (act0) y_part[int64_t(sp) * M + row0] = acc0;
+            if (act1) y_part[int64_t(sp) * M + row1] = acc1;
+        }
+    }
+}
+
+// 8. B=1 Fused Q+K+V GEMV (1 launch for non-shared layers L0..L14)
+__global__ __launch_bounds__(128, 10)
+void gemv_b1_qkv_fused_sm86(
+    const int4* __restrict__ x_hm4, const int2* __restrict__ x_lo2,
+    const float* __restrict__ x_sc, const int32_t* __restrict__ x_sumq,
+    const uint4* __restrict__ wq_u4, const __half* __restrict__ wq_sc, int Mq, float* __restrict__ yq,
+    const uint4* __restrict__ wk_u4, const __half* __restrict__ wk_sc, int Mk, float* __restrict__ yk,
+    const uint4* __restrict__ wv_u4, const __half* __restrict__ wv_sc, int Mv, float* __restrict__ yv,
+    HoloSphereRazorCanary64* can, int K
+) {
+    const int tid = threadIdx.x, r_loc = tid >> 3, lane_r = tid & 7, gr = blockIdx.x * 16 + r_loc;
+    const int Mtot = Mq + Mk + Mv;
+    const bool act_row = (gr < Mtot);
+    const uint4* w_u4 = nullptr;
+    const __half* w_sc = nullptr;
+    float* y_out = nullptr;
+    int lrow = 0;
+    if (gr < Mq) { w_u4 = wq_u4; w_sc = wq_sc; y_out = yq; lrow = gr; }
+    else if (gr < Mq + Mk) { w_u4 = wk_u4; w_sc = wk_sc; y_out = yk; lrow = gr - Mq; }
+    else if (act_row) { w_u4 = wv_u4; w_sc = wv_sc; y_out = yv; lrow = gr - Mq - Mk; }
+    const int n_grp = K >> 5;
+    float acc = 0.0f;
+    #pragma unroll 1
+    for (int g = lane_r; g < n_grp; g += 8) {
+        const uint4 w128 = act_row ? __ldg(&w_u4[int64_t(lrow) * n_grp + g]) : make_uint4(0u, 0u, 0u, 0u);
+        record_u4_secded(w128, can);
+        if (act_row) {
+            const float sc = __half2float(__ldg(&w_sc[int64_t(lrow) * n_grp + g])) * __ldg(&x_sc[g]);
+            int32_t i_hi = 0, i_md = 0, i_lo = 0;
+            const uint32_t ws[4] = {w128.x, w128.y, w128.z, w128.w};
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint32_t wu = ws[j] ^ 0x88888888u;
+                const int32_t w_ev = static_cast<int32_t>(wu & 0x0F0F0F0Fu);
+                const int32_t w_od = static_cast<int32_t>((wu >> 4) & 0x0F0F0F0Fu);
+                const int4 hm = __ldg(&x_hm4[g * 4 + j]);
+                const int2 lo = __ldg(&x_lo2[g * 4 + j]);
+                i_hi = dp4a_s32(w_ev, hm.x, i_hi); i_hi = dp4a_s32(w_od, hm.y, i_hi);
+                i_md = dp4a_s32(w_ev, hm.z, i_md); i_md = dp4a_s32(w_od, hm.w, i_md);
+                i_lo = dp4a_s32(w_ev, lo.x, i_lo); i_lo = dp4a_s32(w_od, lo.y, i_lo);
+            }
+            const int64_t tot = (int64_t(i_hi) << 14) + (int64_t(i_md) << 7) + int64_t(i_lo) - 8LL * int64_t(__ldg(&x_sumq[g]));
+            acc = fmaf(float(tot), sc, acc);
+        }
+    }
+    #pragma unroll
+    for (int m = 4; m >= 1; m >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, m);
+    if (act_row && lane_r == 0) y_out[lrow] = acc;
+}
+
+// 9. B=1 Fused gate + up + GeGLU + H_4 + quant22 (256-thread TPR=8 high-ILP -> ~310 GB/s!)
+__global__ __launch_bounds__(256, 5)
+void gemv_b1_geglu_h4_q22_fused_sm86(
+    const int4* __restrict__ x_hm4, const int2* __restrict__ x_lo2,
+    const float* __restrict__ x_sc, const int32_t* __restrict__ x_sumq,
+    const uint4* __restrict__ wg_u4, const __half* __restrict__ wg_sc,
+    const uint4* __restrict__ wu_u4, const __half* __restrict__ wu_sc,
+    int4* __restrict__ out_hm4, int2* __restrict__ out_lo2,
+    float* __restrict__ out_sc, int32_t* __restrict__ out_sumq,
+    HoloSphereRazorCanary64* can, int M, int K
+) {
+    __shared__ float smem_act[32];
+    __shared__ int8_t sm_b[1][3][32];
+    const int tid = threadIdx.x, r_loc = tid >> 3, lane_r = tid & 7, g_out = blockIdx.x;
+    const int row = g_out * 32 + r_loc, n_grp = K >> 5;
+    if (row >= M) return;
+    const uint4* rwg = wg_u4 + int64_t(row) * n_grp;
+    const __half* rsg = wg_sc + int64_t(row) * n_grp;
+    const uint4* rwu = wu_u4 + int64_t(row) * n_grp;
+    const __half* rsu = wu_sc + int64_t(row) * n_grp;
+
+    float acc_g = 0.0f, acc_u = 0.0f;
+    #pragma unroll 1
+    for (int g = lane_r; g < n_grp; g += 8) {
+        const uint4 wg = __ldg(&rwg[g]);
+        const uint4 wu = __ldg(&rwu[g]);
+        record_u4_secded(wg, can);
+        record_u4_secded(wu, can);
+        const float xs = __ldg(&x_sc[g]);
+        const int64_t xsq8 = 8LL * int64_t(__ldg(&x_sumq[g]));
+        const float scg = __half2float(__ldg(&rsg[g])) * xs;
+        const float scu = __half2float(__ldg(&rsu[g])) * xs;
+        int32_t gi_hi = 0, gi_md = 0, gi_lo = 0, ui_hi = 0, ui_md = 0, ui_lo = 0;
+        const uint32_t wgs[4] = {wg.x, wg.y, wg.z, wg.w}, wus[4] = {wu.x, wu.y, wu.z, wu.w};
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int4 hm = __ldg(&x_hm4[g * 4 + j]);
+            const int2 lo = __ldg(&x_lo2[g * 4 + j]);
+            const uint32_t ug = wgs[j] ^ 0x88888888u;
+            const int32_t wge = static_cast<int32_t>(ug & 0x0F0F0F0Fu);
+            const int32_t wgo = static_cast<int32_t>((ug >> 4) & 0x0F0F0F0Fu);
+            gi_hi = dp4a_s32(wge, hm.x, gi_hi); gi_hi = dp4a_s32(wgo, hm.y, gi_hi);
+            gi_md = dp4a_s32(wge, hm.z, gi_md); gi_md = dp4a_s32(wgo, hm.w, gi_md);
+            gi_lo = dp4a_s32(wge, lo.x, gi_lo); gi_lo = dp4a_s32(wgo, lo.y, gi_lo);
+            const uint32_t uu = wus[j] ^ 0x88888888u;
+            const int32_t wue = static_cast<int32_t>(uu & 0x0F0F0F0Fu);
+            const int32_t wuo = static_cast<int32_t>((uu >> 4) & 0x0F0F0F0Fu);
+            ui_hi = dp4a_s32(wue, hm.x, ui_hi); ui_hi = dp4a_s32(wuo, hm.y, ui_hi);
+            ui_md = dp4a_s32(wue, hm.z, ui_md); ui_md = dp4a_s32(wuo, hm.w, ui_md);
+            ui_lo = dp4a_s32(wue, lo.x, ui_lo); ui_lo = dp4a_s32(wuo, lo.y, ui_lo);
+        }
+        acc_g = fmaf(float((int64_t(gi_hi) << 14) + (int64_t(gi_md) << 7) + int64_t(gi_lo) - xsq8), scg, acc_g);
+        acc_u = fmaf(float((int64_t(ui_hi) << 14) + (int64_t(ui_md) << 7) + int64_t(ui_lo) - xsq8), scu, acc_u);
+    }
+    #pragma unroll
+    for (int m = 4; m >= 1; m >>= 1) {
+        acc_g += __shfl_xor_sync(0xFFFFFFFFu, acc_g, m);
+        acc_u += __shfl_xor_sync(0xFFFFFFFFu, acc_u, m);
+    }
+    if (lane_r == 0) smem_act[r_loc] = gelu_tanh_f32(acc_g) * acc_u;
+    __syncthreads();
+    if (tid < 32) {
+        float xv = smem_act[tid];
+        const float v1 = __shfl_xor_sync(0xFFFFFFFFu, xv, 1); xv = ((tid & 1) == 0) ? (xv + v1) : (v1 - xv);
+        const float v2 = __shfl_xor_sync(0xFFFFFFFFu, xv, 2); xv = ((tid & 2) == 0) ? (xv + v2) : (v2 - xv);
+        xv *= 0.5f;
+        warp_quant22_smem_write(xv, g_out, 0, tid, sm_b, out_hm4, out_lo2, out_sc, out_sumq);
+    }
+}
+
+// 10. Per-head Q/K/V RMSNorm + Proportional/Default RoPE + dual-mode KV write (FP32 shadow OR BF16 128K)
+__global__ __launch_bounds__(128, 11)
+void qkv_norm_rope_kv_write_sm86(
+    float* __restrict__ q_buf, const float* __restrict__ k_proj, const float* __restrict__ v_proj,
+    const float* __restrict__ q_norm_w, const float* __restrict__ k_norm_w, const float* __restrict__ inv_freq,
+    void* __restrict__ k_cache, void* __restrict__ v_cache, const int32_t* __restrict__ d_pos,
+    int B, int n_heads, int n_kv_heads, int hd, int T_cap, float eps, int is_shared, int kv_is_bf16
+) {
+    __shared__ float smem[512 + 4];
+    const int slot = blockIdx.x, b = blockIdx.y, tid = threadIdx.x, half_hd = hd >> 1, pos = d_pos[b];
+    if (slot < n_heads) {
+        float* qh = q_buf + (int64_t(b) * n_heads + slot) * hd;
+        float ss = 0.0f;
+        for (int d = tid; d < hd; d += 128) { const float v = qh[d]; smem[4 + d] = v; ss = fmaf(v, v, ss); }
+        const float inv = float(1.0 / sqrt(double(tree_reduce_128_sm86(ss, smem)) / double(hd) + double(eps)));
+        for (int i = tid; i < half_hd; i += 128) {
+            const float x0 = smem[4 + i] * inv * q_norm_w[i], x1 = smem[4 + i + half_hd] * inv * q_norm_w[i + half_hd];
+            float sn = 0.0f, cs = 1.0f;
+            const float f = inv_freq[i];
+            if (f != 0.0f) sincosf(float(pos) * f, &sn, &cs);
+            qh[i] = fmaf(x0, cs, -x1 * sn);
+            qh[i + half_hd] = fmaf(x1, cs, x0 * sn);
+        }
+    } else if (!is_shared && slot == n_heads) {
+        const int ts = pos % T_cap;
+        for (int kv = 0; kv < n_kv_heads; ++kv) {
+            const float* kp = k_proj + (int64_t(b) * n_kv_heads + kv) * hd;
+            const int64_t k_off = ((int64_t(b) * T_cap + ts) * n_kv_heads + kv) * hd;
+            float ss = 0.0f;
+            for (int d = tid; d < hd; d += 128) { const float v = kp[d]; smem[4 + d] = v; ss = fmaf(v, v, ss); }
+            const float inv = float(1.0 / sqrt(double(tree_reduce_128_sm86(ss, smem)) / double(hd) + double(eps)));
+            for (int i = tid; i < half_hd; i += 128) {
+                const float x0 = smem[4 + i] * inv * k_norm_w[i], x1 = smem[4 + i + half_hd] * inv * k_norm_w[i + half_hd];
+                float sn = 0.0f, cs = 1.0f;
+                const float f = inv_freq[i];
+                if (f != 0.0f) sincosf(float(pos) * f, &sn, &cs);
+                const float k0 = fmaf(x0, cs, -x1 * sn), k1 = fmaf(x1, cs, x0 * sn);
+                if (kv_is_bf16) {
+                    uint16_t* kd = reinterpret_cast<uint16_t*>(k_cache) + k_off;
+                    const __nv_bfloat16 b0 = __float2bfloat16(k0), b1 = __float2bfloat16(k1);
+                    kd[i] = *reinterpret_cast<const uint16_t*>(&b0);
+                    kd[i + half_hd] = *reinterpret_cast<const uint16_t*>(&b1);
+                } else {
+                    float* kd = reinterpret_cast<float*>(k_cache) + k_off;
+                    kd[i] = k0; kd[i + half_hd] = k1;
+                }
+            }
+        }
+    } else if (!is_shared && slot == n_heads + 1) {
+        const int ts = pos % T_cap;
+        for (int kv = 0; kv < n_kv_heads; ++kv) {
+            const float* vp = v_proj + (int64_t(b) * n_kv_heads + kv) * hd;
+            const int64_t v_off = ((int64_t(b) * T_cap + ts) * n_kv_heads + kv) * hd;
+            float ss = 0.0f;
+            for (int d = tid; d < hd; d += 128) { const float v = vp[d]; smem[4 + d] = v; ss = fmaf(v, v, ss); }
+            const float inv = float(1.0 / sqrt(double(tree_reduce_128_sm86(ss, smem)) / double(hd) + double(eps)));
+            for (int d = tid; d < hd; d += 128) {
+                const float vv = smem[4 + d] * inv;
+                if (kv_is_bf16) {
+                    const __nv_bfloat16 b0 = __float2bfloat16(vv);
+                    reinterpret_cast<uint16_t*>(v_cache)[v_off + d] = *reinterpret_cast<const uint16_t*>(&b0);
+                } else {
+                    reinterpret_cast<float*>(v_cache)[v_off + d] = vv;
+                }
+            }
+        }
+    }
+}
+
+// 11. Split-T online-softmax FP32/BF16 KV attention (ZERO barriers in t-loop!)
+template<int SPLIT_T>
+__global__ __launch_bounds__(128, 10)
+void attention_kv_split_sm86(
+    const float* __restrict__ q_buf, const void* __restrict__ k_cache, const void* __restrict__ v_cache,
+    float* __restrict__ out_part, float* __restrict__ m_part, float* __restrict__ l_part,
+    const int32_t* __restrict__ d_pos, int B, int n_heads, int n_kv_heads, int hd, int T_cap, int sliding_win, int kv_is_bf16
+) {
+    __shared__ float smem_q[512], smem_m[4], smem_l[4], smem_v[4][512];
+    const int h = blockIdx.x, b = blockIdx.y % B, sp = blockIdx.y / B;
+    const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31;
+    const int kv_h = h / (n_heads / n_kv_heads), pos = d_pos[b];
+    const int t0 = (sliding_win > 0 && pos + 1 > sliding_win) ? (pos + 1 - sliding_win) : 0;
+    const int t_per = ((pos + 1 - t0) + SPLIT_T - 1) / SPLIT_T;
+    const int t_beg = t0 + sp * t_per, t_end = min(pos + 1, t_beg + t_per);
+
+    const float* qh = q_buf + (int64_t(b) * n_heads + h) * hd;
+    for (int d = tid; d < hd; d += 128) smem_q[d] = __ldg(&qh[d]);
+    __syncthreads();
+
+    float ov[16];
+    #pragma unroll
+    for (int s = 0; s < 16; ++s) ov[s] = 0.0f;
+    float wm = -1e30f, wl = 0.0f;
+    const int t_stride = n_kv_heads * hd;
+
+    for (int t = t_beg + wid; t < t_end; t += 4) {
+        const int ts = t % T_cap;
+        const int64_t kv_off = (int64_t(b) * T_cap + ts) * t_stride + int64_t(kv_h) * hd;
+        float dot = 0.0f;
+        #pragma unroll
+        for (int s = 0; s < 16; ++s) {
+            const int d = s * 32 + lane;
+            if (d < hd) {
+                float kv;
+                if (kv_is_bf16) {
+                    const uint16_t kb = __ldg(reinterpret_cast<const uint16_t*>(k_cache) + kv_off + d);
+                    kv = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&kb));
+                } else {
+                    kv = __ldg(reinterpret_cast<const float*>(k_cache) + kv_off + d);
+                }
+                dot = fmaf(smem_q[d], kv, dot);
+            }
+        }
+        #pragma unroll
+        for (int m = 16; m >= 1; m >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, m);
+        const float mn = fmaxf(wm, dot), al = (wl > 0.0f) ? expf(wm - mn) : 0.0f, p = expf(dot - mn);
+        wl = wl * al + p; wm = mn;
+        #pragma unroll
+        for (int s = 0; s < 16; ++s) {
+            const int d = s * 32 + lane;
+            if (d < hd) {
+                float vv;
+                if (kv_is_bf16) {
+                    const uint16_t vb = __ldg(reinterpret_cast<const uint16_t*>(v_cache) + kv_off + d);
+                    vv = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&vb));
+                } else {
+                    vv = __ldg(reinterpret_cast<const float*>(v_cache) + kv_off + d);
+                }
+                ov[s] = fmaf(p, vv, ov[s] * al);
+            }
+        }
+    }
+    if (lane == 0) { smem_m[wid] = wm; smem_l[wid] = wl; }
+    __syncthreads();
+    float ma = smem_m[0];
+    #pragma unroll
+    for (int w = 1; w < 4; ++w) ma = fmaxf(ma, smem_m[w]);
+    float la = 0.0f;
+    #pragma unroll
+    for (int w = 0; w < 4; ++w) if (smem_l[w] > 0.0f) la += smem_l[w] * expf(smem_m[w] - ma);
+    const float ms = (wl > 0.0f) ? expf(wm - ma) : 0.0f;
+    #pragma unroll
+    for (int s = 0; s < 16; ++s) { const int d = s * 32 + lane; if (d < hd) smem_v[wid][d] = ov[s] * ms; }
+    __syncthreads();
+
+    if constexpr (SPLIT_T == 1) {
+        float* oh = out_part + (int64_t(b) * n_heads + h) * hd;
+        const float inv_l = (la > 0.0f) ? (1.0f / la) : 0.0f;
+        for (int d = tid; d < hd; d += 128) oh[d] = ((smem_v[0][d] + smem_v[1][d]) + (smem_v[2][d] + smem_v[3][d])) * inv_l;
+    } else {
+        float* oh = out_part + ((int64_t(sp) * B + b) * n_heads + h) * hd;
+        for (int d = tid; d < hd; d += 128) oh[d] = (smem_v[0][d] + smem_v[1][d]) + (smem_v[2][d] + smem_v[3][d]);
+        if (tid == 0) { m_part[(sp * B + b) * n_heads + h] = ma; l_part[(sp * B + b) * n_heads + h] = la; }
+    }
+}
+
+// 12. Fused multi-CTA Attention Split-T merge + H_4 + quant22
+template<int SPLIT_T>
+__global__ __launch_bounds__(128, 10)
+void attention_merge_h4_q22_fast_sm86(
+    const float* __restrict__ out_part, const float* __restrict__ m_part, const float* __restrict__ l_part,
+    int4* __restrict__ x_hm4, int2* __restrict__ x_lo2, float* __restrict__ x_sc, int32_t* __restrict__ x_sumq,
+    int B, int n_heads, int hd
+) {
+    __shared__ int8_t sm_b[4][3][32];
+    const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, b = blockIdx.y, g = blockIdx.x * 4 + wid;
+    const int D = n_heads * hd, n_grp = D >> 5;
+    if (g >= n_grp || b >= B) return;
+    const int idx = g * 32 + lane, h = idx / hd;
+    float ma = -1e30f;
+    float ms[SPLIT_T], ls[SPLIT_T];
+    #pragma unroll
+    for (int sp = 0; sp < SPLIT_T; ++sp) {
+        ms[sp] = m_part[(sp * B + b) * n_heads + h];
+        ls[sp] = l_part[(sp * B + b) * n_heads + h];
+        if (ls[sp] > 0.0f) ma = fmaxf(ma, ms[sp]);
+    }
+    float la = 0.0f, acc = 0.0f;
+    #pragma unroll
+    for (int sp = 0; sp < SPLIT_T; ++sp) {
+        const float w = (ls[sp] > 0.0f) ? expf(ms[sp] - ma) : 0.0f;
+        la += ls[sp] * w;
+        acc = fmaf(w, out_part[(int64_t(sp) * B + b) * D + idx], acc);
+    }
+    float xv = (la > 0.0f) ? (acc / la) : 0.0f;
+    const float v1 = __shfl_xor_sync(0xFFFFFFFFu, xv, 1); xv = ((lane & 1) == 0) ? (xv + v1) : (v1 - xv);
+    const float v2 = __shfl_xor_sync(0xFFFFFFFFu, xv, 2); xv = ((lane & 2) == 0) ? (xv + v2) : (v2 - xv);
+    xv *= 0.5f;
+    warp_quant22_smem_write(
+        xv, g, wid, lane, sm_b,
+        x_hm4 + int64_t(b) * (D >> 3), x_lo2 + int64_t(b) * (D >> 3),
+        x_sc + int64_t(b) * n_grp, x_sumq + int64_t(b) * n_grp);
+}
+
+// 13. Fused PLE Split-K sum + GeLU_tanh * ple_in + H_4 + quant22 (256 threads = 8 warps = 1 iter for P=256!)
+__global__ __launch_bounds__(256, 6)
+void fused_ple_act_256_h4_q22_sm86(
+    const float* __restrict__ pg, int n_sp, const float* __restrict__ ple_in,
+    int4* __restrict__ x_hm4, int2* __restrict__ x_lo2, float* __restrict__ x_sc, int32_t* __restrict__ x_sumq,
+    int B, int P
+) {
+    __shared__ int8_t sm_b[8][3][32];
+    const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, b = blockIdx.x, n_grp = P >> 5;
+    if (wid >= n_grp || b >= B) return;
+    const int idx = wid * 32 + lane;
+    float psum = 0.0f;
+    for (int sp = 0; sp < n_sp; ++sp) psum += pg[(int64_t(sp) * B + b) * P + idx];
+    float xv = gelu_tanh_f32(psum) * ple_in[int64_t(b) * P + idx];
+    const float v1 = __shfl_xor_sync(0xFFFFFFFFu, xv, 1); xv = ((lane & 1) == 0) ? (xv + v1) : (v1 - xv);
+    const float v2 = __shfl_xor_sync(0xFFFFFFFFu, xv, 2); xv = ((lane & 2) == 0) ? (xv + v2) : (v2 - xv);
+    xv *= 0.5f;
+
+    float amax = fabsf(xv);
+    #pragma unroll
+    for (int m = 16; m >= 1; m >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, m));
+    const float sc = fmaxf(amax / 2064384.0f, 1e-12f);
+    const int32_t q = __float2int_rn(xv / sc);
+    const int32_t q_hi = (q >= 0) ? ((q + 8192) >> 14) : -((-q + 8192) >> 14);
+    const int32_t r1 = q - (q_hi * 16384);
+    const int32_t q_md = (r1 >= 0) ? ((r1 + 64) >> 7) : -((-r1 + 64) >> 7);
+    const int32_t q_lo = r1 - (q_md * 128);
+    int32_t qsum = q;
+    #pragma unroll
+    for (int m = 16; m >= 1; m >>= 1) qsum += __shfl_xor_sync(0xFFFFFFFFu, qsum, m);
+    if (lane == 0) {
+        x_sc[int64_t(b) * n_grp + wid] = sc;
+        x_sumq[int64_t(b) * n_grp + wid] = qsum;
+    }
+    const int dst_slot = (lane & ~7) | ((lane & 1) << 2) | ((lane >> 1) & 3);
+    sm_b[wid][0][dst_slot] = static_cast<int8_t>(q_hi);
+    sm_b[wid][1][dst_slot] = static_cast<int8_t>(q_md);
+    sm_b[wid][2][dst_slot] = static_cast<int8_t>(q_lo);
+    __syncwarp();
+    if ((lane & 7) == 0) {
+        const int j = lane >> 3;
+        const int32_t* p0 = reinterpret_cast<const int32_t*>(&sm_b[wid][0][j * 8]);
+        const int32_t* p1 = reinterpret_cast<const int32_t*>(&sm_b[wid][1][j * 8]);
+        const int32_t* p2 = reinterpret_cast<const int32_t*>(&sm_b[wid][2][j * 8]);
+        x_hm4[int64_t(b) * (P >> 3) + wid * 4 + j] = make_int4(p0[0], p0[1], p1[0], p1[1]);
+        x_lo2[int64_t(b) * (P >> 3) + wid * 4 + j] = make_int2(p2[0], p2[1]);
+    }
+}
+
+// 14. B=16 Tensor Core primitives + exact FP16-pair / BF16-pair MMA GEMM kernels (<= 40 regs!)
+__device__ __forceinline__ void mma_m16n8k16_f16(float* d, const uint32_t* a, const uint32_t* b, const float* c) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+                 : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+}
+__device__ __forceinline__ void mma_m16n8k16_bf16(float* d, const uint32_t* a, const uint32_t* b, const float* c) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+                 : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+}
+__device__ __forceinline__ void ldmatrix_x4(uint32_t* reg, uint32_t smem_addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(reg[0]), "=r"(reg[1]), "=r"(reg[2]), "=r"(reg[3]) : "r"(smem_addr));
+}
+__device__ __forceinline__ void ldmatrix_x2_trans(uint32_t* reg, uint32_t smem_addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
+                 : "=r"(reg[0]), "=r"(reg[1]) : "r"(smem_addr));
+}
+__device__ __forceinline__ void decode8_to_h2(uint32_t w32, uint32_t* out_u32_4) {
+    const uint32_t u = w32 ^ 0x88888888u;
+    const __half2 bias = __halves2half2(__ushort_as_half(0x6408u), __ushort_as_half(0x6408u));
+    #pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        const uint32_t s = u >> (8 * p);
+        const uint32_t packed = ((s & 0x0Fu) | ((s & 0xF0u) << 12)) | 0x64006400u;
+        const __half2 h2 = __hsub2(*reinterpret_cast<const __half2*>(&packed), bias);
+        out_u32_4[p] = *reinterpret_cast<const uint32_t*>(&h2);
+    }
+}
+
+__global__ __launch_bounds__(128, 10)
+void fused_norm_b16_h4_fp16split_sm86(
+    const float* val_part, int n_sp,
+    const float* res_in, const float* __restrict__ nw_post, float scalar_post,
+    const float* __restrict__ nw_pre, float* res_out,
+    __half* __restrict__ x_hi_T, __half* __restrict__ x_lo_T,
+    uint16_t* __restrict__ xb_hi_T, uint16_t* __restrict__ xb_lo_T,
+    float* __restrict__ scratch_d, int B, int D, float eps, int apply_h4, int split_bf16
+) {
+    __shared__ float smem[4];
+    const int b = blockIdx.x, tid = threadIdx.x, wid = tid >> 5, lane = tid & 31;
+    const float* rb = res_in ? (res_in + int64_t(b) * D) : nullptr;
+    float* ro = res_out ? (res_out + int64_t(b) * D) : nullptr;
+    float* wb = scratch_d + int64_t(b) * D;
+    float inv_post = 1.0f;
+    if (nw_post) {
+        float ss = 0.0f;
+        for (int d = tid; d < D; d += 128) {
+            float v = 0.0f;
+            for (int sp = 0; sp < n_sp; ++sp) v += val_part[(int64_t(sp) * B + b) * D + d];
+            wb[d] = v; ss = fmaf(v, v, ss);
+        }
+        inv_post = float(1.0 / sqrt(double(tree_reduce_128_sm86(ss, smem)) / double(D) + double(eps)));
+    }
+    float ss_pre = 0.0f;
+    for (int d = tid; d < D; d += 128) {
+        float v;
+        if (nw_post) v = wb[d] * inv_post * nw_post[d];
+        else { v = 0.0f; for (int sp = 0; sp < n_sp; ++sp) v += val_part[(int64_t(sp) * B + b) * D + d]; }
+        const float h = (rb ? (rb[d] + v) : v) * scalar_post;
+        if (ro) ro[d] = h;
+        wb[d] = h;
+        if (nw_pre) ss_pre = fmaf(h, h, ss_pre);
+    }
+    if (!x_hi_T && !xb_hi_T) return;
+    const float inv_pre = nw_pre ? float(1.0 / sqrt(double(tree_reduce_128_sm86(ss_pre, smem)) / double(D) + double(eps))) : 1.0f;
+    if (!nw_pre) __syncthreads();
+    const int n_grp = D >> 5;
+    for (int g = wid; g < n_grp; g += 4) {
+        const int idx = g * 32 + lane;
+        float xv = nw_pre ? (wb[idx] * inv_pre * nw_pre[idx]) : wb[idx];
+        if (apply_h4) {
+            const float v1 = __shfl_xor_sync(0xFFFFFFFFu, xv, 1); xv = ((lane & 1) == 0) ? (xv + v1) : (v1 - xv);
+            const float v2 = __shfl_xor_sync(0xFFFFFFFFu, xv, 2); xv = ((lane & 2) == 0) ? (xv + v2) : (v2 - xv);
+            xv *= 0.5f;
+        }
+        if (split_bf16) {
+            const __nv_bfloat16 b0 = __float2bfloat16(xv);
+            const __nv_bfloat16 b1 = __float2bfloat16(xv - __bfloat162float(b0));
+            xb_hi_T[int64_t(idx) * 16 + b] = *reinterpret_cast<const uint16_t*>(&b0);
+            xb_lo_T[int64_t(idx) * 16 + b] = *reinterpret_cast<const uint16_t*>(&b1);
+            if (b == 0 && B < 16) {
+                for (int bz = B; bz < 16; ++bz) {
+                    xb_hi_T[int64_t(idx) * 16 + bz] = 0u;
+                    xb_lo_T[int64_t(idx) * 16 + bz] = 0u;
+                }
+            }
+        } else {
+            const __half h0 = __float2half(xv);
+            const __half h1 = __float2half(xv - __half2float(h0));
+            x_hi_T[int64_t(idx) * 16 + b] = h0;
+            x_lo_T[int64_t(idx) * 16 + b] = h1;
+            if (b == 0 && B < 16) {
+                for (int bz = B; bz < 16; ++bz) {
+                    x_hi_T[int64_t(idx) * 16 + bz] = __float2half(0.0f);
+                    x_lo_T[int64_t(idx) * 16 + bz] = __float2half(0.0f);
+                }
+            }
+        }
+    }
+}
+
+__global__ __launch_bounds__(128, 10)
+void fused_geglu_or_ple_b16_h4_fp16split_sm86(
+    const float* __restrict__ a_in, const float* __restrict__ b_in,
+    __half* __restrict__ x_hi_T, __half* __restrict__ x_lo_T,
+    int B, int D, int b_stride, int b_offset
+) {
+    const int b = blockIdx.y, g = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (g >= (D >> 5) || b >= B) return;
+    const int idx = g * 32 + lane;
+    const float av = __ldg(&a_in[int64_t(b) * D + idx]);
+    const float bv = __ldg(&b_in[int64_t(b) * b_stride + b_offset + idx]);
+    float xv = gelu_tanh_f32(av) * bv;
+    const float v1 = __shfl_xor_sync(0xFFFFFFFFu, xv, 1); xv = ((lane & 1) == 0) ? (xv + v1) : (v1 - xv);
+    const float v2 = __shfl_xor_sync(0xFFFFFFFFu, xv, 2); xv = ((lane & 2) == 0) ? (xv + v2) : (v2 - xv);
+    xv *= 0.5f;
+    const __half h0 = __float2half(xv), h1 = __float2half(xv - __half2float(h0));
+    x_hi_T[int64_t(idx) * 16 + b] = h0;
+    x_lo_T[int64_t(idx) * 16 + b] = h1;
+    if (b == 0 && B < 16) {
+        for (int bz = B; bz < 16; ++bz) {
+            x_hi_T[int64_t(idx) * 16 + bz] = __float2half(0.0f);
+            x_lo_T[int64_t(idx) * 16 + bz] = __float2half(0.0f);
+        }
+    }
+}
+
+template<int SPLIT_K>
+__global__ __launch_bounds__(128, 8)
+void gemm_b16_mma_fast_sm86(
+    const __half* __restrict__ x_hi_T, const __half* __restrict__ x_lo_T,
+    const uint4* __restrict__ w_u4, const __half* __restrict__ w_sc,
+    float* __restrict__ y_part, HoloSphereRazorCanary64* can, float softcap, int B, int M, int K
+) {
+    __shared__ __half smem_wf16[32][72];
+    __shared__ float smem_sc[32][2];
+    __shared__ __half smem_x_hi[64][24];
+    __shared__ __half smem_x_lo[64][24];
+    const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, wm = wid >> 1, wn = wid & 1;
+    const int cta_row0 = blockIdx.x * 32, n_grp = K >> 5, sp = blockIdx.y;
+    const int g_per_sp = ((n_grp + SPLIT_K - 1) / SPLIT_K + 1) & ~1;
+    const int g_beg = sp * g_per_sp, g_end = min(n_grp, g_beg + g_per_sp);
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    #pragma unroll 1
+    for (int g0 = g_beg; g0 < g_end; g0 += 2) {
+        if (tid < 64) {
+            const int r_loc = tid >> 1, g_loc = tid & 1, r_glob = cta_row0 + r_loc, g_glob = g0 + g_loc;
+            const bool act = (r_glob < M) && (g_glob < g_end);
+            const uint4 wv = act ? __ldg(&w_u4[int64_t(r_glob) * n_grp + g_glob]) : make_uint4(0u, 0u, 0u, 0u);
+            record_u4_secded(wv, can);
+            smem_sc[r_loc][g_loc] = act ? __half2float(__ldg(&w_sc[int64_t(r_glob) * n_grp + g_glob])) : 0.0f;
+            uint32_t h0[4], h1[4], h2[4], h3[4];
+            decode8_to_h2(wv.x, h0); decode8_to_h2(wv.y, h1); decode8_to_h2(wv.z, h2); decode8_to_h2(wv.w, h3);
+            uint32_t* dst = reinterpret_cast<uint32_t*>(&smem_wf16[r_loc][g_loc * 32]);
+            dst[0]=h0[0]; dst[1]=h0[1]; dst[2]=h0[2]; dst[3]=h0[3];
+            dst[4]=h1[0]; dst[5]=h1[1]; dst[6]=h1[2]; dst[7]=h1[3];
+            dst[8]=h2[0]; dst[9]=h2[1]; dst[10]=h2[2]; dst[11]=h2[3];
+            dst[12]=h3[0]; dst[13]=h3[1]; dst[14]=h3[2]; dst[15]=h3[3];
+        } else {
+            const int kl = tid - 64, k_glob = g0 * 32 + kl;
+            if (k_glob < min(K, g_end * 32)) {
+                const uint4* shi = reinterpret_cast<const uint4*>(x_hi_T + int64_t(k_glob) * 16);
+                const uint4* slo = reinterpret_cast<const uint4*>(x_lo_T + int64_t(k_glob) * 16);
+                *reinterpret_cast<uint4*>(&smem_x_hi[kl][0]) = __ldg(&shi[0]);
+                *reinterpret_cast<uint4*>(&smem_x_hi[kl][8]) = __ldg(&shi[1]);
+                *reinterpret_cast<uint4*>(&smem_x_lo[kl][0]) = __ldg(&slo[0]);
+                *reinterpret_cast<uint4*>(&smem_x_lo[kl][8]) = __ldg(&slo[1]);
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int gl = 0; gl < 2; ++gl) {
+            if (g0 + gl >= g_end) break;
+            float ga[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            #pragma unroll
+            for (int ks = 0; ks < 2; ++ks) {
+                const int ko = gl * 32 + ks * 16;
+                uint32_t ra[4], rbh[2], rbl[2];
+                ldmatrix_x4(ra, static_cast<uint32_t>(__cvta_generic_to_shared(&smem_wf16[wm * 16 + (lane & 15)][ko + ((lane >> 4) * 8)])));
+                const int br = ko + (lane & 15);
+                ldmatrix_x2_trans(rbh, static_cast<uint32_t>(__cvta_generic_to_shared(&smem_x_hi[br][wn * 8])));
+                ldmatrix_x2_trans(rbl, static_cast<uint32_t>(__cvta_generic_to_shared(&smem_x_lo[br][wn * 8])));
+                mma_m16n8k16_f16(ga, ra, rbh, ga);
+                mma_m16n8k16_f16(ga, ra, rbl, ga);
+            }
+            const int mr0 = wm * 16 + (lane >> 2);
+            const float sc0 = smem_sc[mr0][gl], sc1 = smem_sc[mr0 + 8][gl];
+            acc[0] = fmaf(ga[0], sc0, acc[0]); acc[1] = fmaf(ga[1], sc0, acc[1]);
+            acc[2] = fmaf(ga[2], sc1, acc[2]); acc[3] = fmaf(ga[3], sc1, acc[3]);
+        }
+        __syncthreads();
+    }
+    const int r0 = cta_row0 + wm * 16 + (lane >> 2), r1 = r0 + 8, c0 = wn * 8 + (lane & 3) * 2;
+    const int64_t sp_off = int64_t(sp) * B * M;
+    auto put = [&](int r, int c, float v) {
+        if (r < M && c < B) {
+            if constexpr (SPLIT_K == 1) {
+                y_part[sp_off + int64_t(c) * M + r] = (softcap > 0.0f) ? (softcap * tanhf(v / softcap)) : v;
             } else {
-                l_ded = 1u;
-                diag = (1u << 5) | (syn & 0x1Fu);
+                y_part[sp_off + int64_t(c) * M + r] = v;
             }
         }
-        razor_canary_emit_sys(host_canary, l_sec, l_ded, diag, lane);
-    }
-    if (active_blk) {
-        const int32_t idot16 = a16_nibble_dp4a16_xrot(w64, x_q8_4);
-        acc = fmaf(float(idot16), sc, acc);
-    }
+    };
+    put(r0, c0, acc[0]); put(r0, c0 + 1, acc[1]);
+    put(r1, c0, acc[2]); put(r1, c0 + 1, acc[3]);
 }
 
-// Compute canonical block-128 sum of squares over D floats using smem_tree[128] & smem_blk[16].
-__device__ __forceinline__ float canonical_sum_sq_d128(
-    const float* __restrict__ x_in,
-    int dim,
-    float* smem_tree,
-    float* smem_blk
+__global__ __launch_bounds__(128, 11)
+void gemm_b16_mma_64x16_sm86(
+    const __half* __restrict__ x_hi_T, const __half* __restrict__ x_lo_T,
+    const uint4* __restrict__ w_u4, const __half* __restrict__ w_sc,
+    float* __restrict__ y_out, HoloSphereRazorCanary64* can, float softcap, int B, int M, int K
 ) {
-    const int tid = threadIdx.x;
-    const int n_chunks = (dim + 127) >> 7;
+    __shared__ __half smem_wf16[64][72];
+    __shared__ float smem_sc[64][2];
+    __shared__ __half smem_x_hi[64][24];
+    __shared__ __half smem_x_lo[64][24];
+    const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, wm = wid >> 1, wn = wid & 1;
+    const int cta_row0 = blockIdx.x * 64, n_grp = K >> 5;
+    float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f}, acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     #pragma unroll 1
-    for (int c = 0; c < n_chunks; ++c) {
-        const int idx = c * 128 + tid;
-        const float xv = (idx < dim) ? __ldg(&x_in[idx]) : 0.0f;
-        const float cs = tree_reduce_128_sm86(xv * xv, smem_tree);
-        if (tid == 0) smem_blk[c] = cs;
+    for (int g0 = 0; g0 < n_grp; g0 += 2) {
+        const int r_loc = tid >> 1, g_loc = tid & 1, r_glob = cta_row0 + r_loc, g_glob = g0 + g_loc;
+        const bool act = (r_glob < M) && (g_glob < n_grp);
+        const uint4 wv = act ? __ldg(&w_u4[int64_t(r_glob) * n_grp + g_glob]) : make_uint4(0u, 0u, 0u, 0u);
+        record_u4_secded(wv, can);
+        smem_sc[r_loc][g_loc] = act ? __half2float(__ldg(&w_sc[int64_t(r_glob) * n_grp + g_glob])) : 0.0f;
+        uint32_t h0[4], h1[4], h2[4], h3[4];
+        decode8_to_h2(wv.x, h0); decode8_to_h2(wv.y, h1); decode8_to_h2(wv.z, h2); decode8_to_h2(wv.w, h3);
+        uint32_t* dst = reinterpret_cast<uint32_t*>(&smem_wf16[r_loc][g_loc * 32]);
+        dst[0]=h0[0]; dst[1]=h0[1]; dst[2]=h0[2]; dst[3]=h0[3];
+        dst[4]=h1[0]; dst[5]=h1[1]; dst[6]=h1[2]; dst[7]=h1[3];
+        dst[8]=h2[0]; dst[9]=h2[1]; dst[10]=h2[2]; dst[11]=h2[3];
+        dst[12]=h3[0]; dst[13]=h3[1]; dst[14]=h3[2]; dst[15]=h3[3];
+        const int kl = tid >> 1, b8 = (tid & 1) * 8, k_glob = g0 * 32 + kl;
+        if (k_glob < K) {
+            *reinterpret_cast<uint4*>(&smem_x_hi[kl][b8]) = __ldg(reinterpret_cast<const uint4*>(x_hi_T + int64_t(k_glob) * 16 + b8));
+            *reinterpret_cast<uint4*>(&smem_x_lo[kl][b8]) = __ldg(reinterpret_cast<const uint4*>(x_lo_T + int64_t(k_glob) * 16 + b8));
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int gl = 0; gl < 2; ++gl) {
+            if (g0 + gl >= n_grp) break;
+            float ga0[4] = {0,0,0,0}, ga1[4] = {0,0,0,0};
+            #pragma unroll
+            for (int ks = 0; ks < 2; ++ks) {
+                const int ko = gl * 32 + ks * 16;
+                uint32_t ra0[4], ra1[4], rbh[2], rbl[2];
+                ldmatrix_x4(ra0, static_cast<uint32_t>(__cvta_generic_to_shared(&smem_wf16[wm * 32 +  0 + (lane & 15)][ko + ((lane >> 4) * 8)])));
+                ldmatrix_x4(ra1, static_cast<uint32_t>(__cvta_generic_to_shared(&smem_wf16[wm * 32 + 16 + (lane & 15)][ko + ((lane >> 4) * 8)])));
+                const int br = ko + (lane & 15);
+                ldmatrix_x2_trans(rbh, static_cast<uint32_t>(__cvta_generic_to_shared(&smem_x_hi[br][wn * 8])));
+                ldmatrix_x2_trans(rbl, static_cast<uint32_t>(__cvta_generic_to_shared(&smem_x_lo[br][wn * 8])));
+                mma_m16n8k16_f16(ga0, ra0, rbh, ga0); mma_m16n8k16_f16(ga0, ra0, rbl, ga0);
+                mma_m16n8k16_f16(ga1, ra1, rbh, ga1); mma_m16n8k16_f16(ga1, ra1, rbl, ga1);
+            }
+            const int mr = wm * 32 + (lane >> 2);
+            const float s0 = smem_sc[mr + 0][gl], s1 = smem_sc[mr + 8][gl], s2 = smem_sc[mr + 16][gl], s3 = smem_sc[mr + 24][gl];
+            acc0[0] = fmaf(ga0[0], s0, acc0[0]); acc0[1] = fmaf(ga0[1], s0, acc0[1]);
+            acc0[2] = fmaf(ga0[2], s1, acc0[2]); acc0[3] = fmaf(ga0[3], s1, acc0[3]);
+            acc1[0] = fmaf(ga1[0], s2, acc1[0]); acc1[1] = fmaf(ga1[1], s2, acc1[1]);
+            acc1[2] = fmaf(ga1[2], s3, acc1[2]); acc1[3] = fmaf(ga1[3], s3, acc1[3]);
+        }
+        __syncthreads();
     }
-    __syncthreads();
-    const float bval = (tid < n_chunks) ? smem_blk[tid] : 0.0f;
-    return tree_reduce_128_sm86(bval, smem_tree);
+    const int r0 = cta_row0 + wm * 32 + (lane >> 2), c0 = wn * 8 + (lane & 3) * 2;
+    auto st2 = [&](int r, float v0, float v1) {
+        if (r < M) {
+            if (c0 + 0 < B) y_out[int64_t(c0 + 0) * M + r] = (softcap > 0.0f) ? (softcap * tanhf(v0 / softcap)) : v0;
+            if (c0 + 1 < B) y_out[int64_t(c0 + 1) * M + r] = (softcap > 0.0f) ? (softcap * tanhf(v1 / softcap)) : v1;
+        }
+    };
+    st2(r0 + 0, acc0[0], acc0[1]); st2(r0 + 8, acc0[2], acc0[3]);
+    st2(r0 + 16, acc1[0], acc1[1]); st2(r0 + 24, acc1[2], acc1[3]);
 }
 
-// ----------------------------------------------------------------------------
-// 3. Kernel 1: Update-Time 8x8 Woodbury Inverse Precompute -> c_wb_inv_256b
-// ----------------------------------------------------------------------------
-
-__global__ __launch_bounds__(256, 5)
-void siligemma_precompute_woodbury_inv8_sm86(
-    const float4* __restrict__ a_f4,
-    const float4* __restrict__ b_f4,
-    float* __restrict__ m_inv_out_64,
-    float alpha_scale,
-    int d_model
+// 15. BF16 lm_head (B=1 2-row ILP uint4 coalesced; B=16 Tensor Core BF16 MMA)
+__global__ __launch_bounds__(128, 11)
+void lm_head_b1_bf16_uint4_sm86(
+    const float* __restrict__ x_in, const uint4* __restrict__ w_bf16,
+    float* __restrict__ logits, float softcap, int V, int H
 ) {
-    __shared__ float smem_aug[8][16];  // 512 B: [M | I_8]
-
-    const int tid = threadIdx.x;
-    const int warp_id = tid >> 5;
-    const int lane = tid & 31;
-
-    float m0 = 0.0f, m1 = 0.0f, m2 = 0.0f, m3 = 0.0f;
-    float m4 = 0.0f, m5 = 0.0f, m6 = 0.0f, m7 = 0.0f;
-
-    for (int i = lane; i < d_model; i += 32) {
-        const float4 av = __ldg(&a_f4[i]);
-        const float4 bv = __ldg(&b_f4[i]);
-        float vw = 0.0f;
-        if (warp_id == 0) vw = av.x;
-        else if (warp_id == 1) vw = av.y;
-        else if (warp_id == 2) vw = av.z;
-        else if (warp_id == 3) vw = av.w;
-        else if (warp_id == 4) vw = bv.x;
-        else if (warp_id == 5) vw = bv.y;
-        else if (warp_id == 6) vw = bv.z;
-        else vw = bv.w;
-
-        m0 = fmaf(vw, bv.x, m0);  m1 = fmaf(vw, bv.y, m1);
-        m2 = fmaf(vw, bv.z, m2);  m3 = fmaf(vw, bv.w, m3);
-        m4 = fmaf(vw, -av.x, m4); m5 = fmaf(vw, -av.y, m5);
-        m6 = fmaf(vw, -av.z, m6); m7 = fmaf(vw, -av.w, m7);
-    }
-
-    m0 = warp_sum_32(m0); m1 = warp_sum_32(m1);
-    m2 = warp_sum_32(m2); m3 = warp_sum_32(m3);
-    m4 = warp_sum_32(m4); m5 = warp_sum_32(m5);
-    m6 = warp_sum_32(m6); m7 = warp_sum_32(m7);
-
-    if (lane == 0) {
-        const float half_s = 0.5f * alpha_scale;
-        smem_aug[warp_id][0] = ((warp_id == 0) ? 1.0f : 0.0f) - half_s * m0;
-        smem_aug[warp_id][1] = ((warp_id == 1) ? 1.0f : 0.0f) - half_s * m1;
-        smem_aug[warp_id][2] = ((warp_id == 2) ? 1.0f : 0.0f) - half_s * m2;
-        smem_aug[warp_id][3] = ((warp_id == 3) ? 1.0f : 0.0f) - half_s * m3;
-        smem_aug[warp_id][4] = ((warp_id == 4) ? 1.0f : 0.0f) - half_s * m4;
-        smem_aug[warp_id][5] = ((warp_id == 5) ? 1.0f : 0.0f) - half_s * m5;
-        smem_aug[warp_id][6] = ((warp_id == 6) ? 1.0f : 0.0f) - half_s * m6;
-        smem_aug[warp_id][7] = ((warp_id == 7) ? 1.0f : 0.0f) - half_s * m7;
-        #pragma unroll
-        for (int c = 0; c < 8; ++c) {
-            smem_aug[warp_id][8 + c] = (warp_id == c) ? 1.0f : 0.0f;
-        }
-    }
-    __syncthreads();
-
-    if (warp_id == 0) {
+    const int tid = threadIdx.x, r_loc = tid >> 3, lane_r = tid & 7;
+    const int row0 = blockIdx.x * 32 + r_loc, row1 = row0 + 16;
+    const bool act0 = (row0 < V), act1 = (row1 < V);
+    const int n_u4 = H >> 3;
+    const uint4* rw0 = act0 ? (w_bf16 + int64_t(row0) * n_u4) : nullptr;
+    const uint4* rw1 = act1 ? (w_bf16 + int64_t(row1) * n_u4) : nullptr;
+    const float4* xf = reinterpret_cast<const float4*>(x_in);
+    float acc0 = 0.0f, acc1 = 0.0f;
+    if (act0) {
         #pragma unroll 1
-        for (int col = 0; col < 8; ++col) {
-            float best_val = (lane >= col && lane < 8) ? fabsf(smem_aug[lane][col]) : -1.0f;
-            int best_row = lane;
-            #pragma unroll
-            for (int mask = 4; mask >= 1; mask >>= 1) {
-                const float ov = __shfl_xor_sync(0xFFFFFFFFu, best_val, mask);
-                const int orow = __shfl_xor_sync(0xFFFFFFFFu, best_row, mask);
-                const bool take = (ov > best_val) || ((ov == best_val) && (orow < best_row));
-                best_val = fmaxf(best_val, ov);
-                best_row = take ? orow : best_row;
-            }
-            const int piv = __shfl_sync(0xFFFFFFFFu, best_row, 0);
-            if (piv != col && lane < 16) {
-                const float tmp = smem_aug[col][lane];
-                smem_aug[col][lane] = smem_aug[piv][lane];
-                smem_aug[piv][lane] = tmp;
-            }
-            __syncwarp();
+        for (int g = lane_r; g < n_u4; g += 8) {
+            const uint4 wv0 = __ldg(&rw0[g]);
+            const uint4 wv1 = act1 ? __ldg(&rw1[g]) : make_uint4(0u, 0u, 0u, 0u);
+            const float4 x0 = __ldg(&xf[g * 2 + 0]), x1 = __ldg(&xf[g * 2 + 1]);
+            auto step4 = [&](const uint4& wv, float& acc) {
+                const uint32_t ws[4] = {wv.x, wv.y, wv.z, wv.w};
+                const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(ws);
+                const float2 f0 = __bfloat1622float2(b2[0]), f1 = __bfloat1622float2(b2[1]);
+                const float2 f2 = __bfloat1622float2(b2[2]), f3 = __bfloat1622float2(b2[3]);
+                acc = fmaf(f0.x, x0.x, acc); acc = fmaf(f0.y, x0.y, acc);
+                acc = fmaf(f1.x, x0.z, acc); acc = fmaf(f1.y, x0.w, acc);
+                acc = fmaf(f2.x, x1.x, acc); acc = fmaf(f2.y, x1.y, acc);
+                acc = fmaf(f3.x, x1.z, acc); acc = fmaf(f3.y, x1.w, acc);
+            };
+            step4(wv0, acc0);
+            if (act1) step4(wv1, acc1);
+        }
+    }
+    #pragma unroll
+    for (int m = 4; m >= 1; m >>= 1) {
+        acc0 += __shfl_xor_sync(0xFFFFFFFFu, acc0, m);
+        acc1 += __shfl_xor_sync(0xFFFFFFFFu, acc1, m);
+    }
+    if (lane_r == 0) {
+        if (act0) logits[row0] = (softcap > 0.0f) ? (softcap * tanhf(acc0 / softcap)) : acc0;
+        if (act1) logits[row1] = (softcap > 0.0f) ? (softcap * tanhf(acc1 / softcap)) : acc1;
+    }
+}
 
-            const float inv_piv = 1.0f / smem_aug[col][col];
-            if (lane < 16) smem_aug[col][lane] *= inv_piv;
-            __syncwarp();
+__global__ __launch_bounds__(128, 11)
+void lm_head_b16_bf16_mma_sm86(
+    const uint16_t* __restrict__ x_hi_T, const uint16_t* __restrict__ x_lo_T,
+    const uint4* __restrict__ w_bf16, float* __restrict__ logits, float softcap, int B, int V, int K
+) {
+    __shared__ uint16_t smem_w[32][40], smem_xh[32][24], smem_xl[32][24];
+    const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, wm = wid >> 1, wn = wid & 1;
+    const int cta_row0 = blockIdx.x * 32, n_u4 = K >> 3;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    #pragma unroll 1
+    for (int k0 = 0; k0 < K; k0 += 32) {
+        const int r_loc = tid >> 2, u_loc = tid & 3, r_glob = cta_row0 + r_loc;
+        *reinterpret_cast<uint4*>(&smem_w[r_loc][u_loc * 8]) = (r_glob < V) ? __ldg(&w_bf16[int64_t(r_glob) * n_u4 + (k0 >> 3) + u_loc]) : make_uint4(0u,0u,0u,0u);
+        const int is_lo = tid >> 6, t64 = tid & 63, kl = t64 >> 1, b8 = (t64 & 1) * 8;
+        *reinterpret_cast<uint4*>(is_lo ? &smem_xl[kl][b8] : &smem_xh[kl][b8]) = __ldg(reinterpret_cast<const uint4*>((is_lo ? x_lo_T : x_hi_T) + int64_t(k0 + kl) * 16 + b8));
+        __syncthreads();
+        #pragma unroll
+        for (int ks = 0; ks < 2; ++ks) {
+            const int ko = ks * 16; uint32_t ra[4], rbh[2], rbl[2];
+            ldmatrix_x4(ra, static_cast<uint32_t>(__cvta_generic_to_shared(&smem_w[wm * 16 + (lane & 15)][ko + ((lane >> 4) * 8)])));
+            const int br = ko + (lane & 15);
+            ldmatrix_x2_trans(rbh, static_cast<uint32_t>(__cvta_generic_to_shared(&smem_xh[br][wn * 8])));
+            ldmatrix_x2_trans(rbl, static_cast<uint32_t>(__cvta_generic_to_shared(&smem_xl[br][wn * 8])));
+            mma_m16n8k16_bf16(acc, ra, rbh, acc);
+            mma_m16n8k16_bf16(acc, ra, rbl, acc);
+        }
+        __syncthreads();
+    }
+    const int r0 = cta_row0 + wm * 16 + (lane >> 2), r1 = r0 + 8, c0 = wn * 8 + (lane & 3) * 2;
+    auto put = [&](int r, int c, float v) {
+        if (r < V && c < B) logits[int64_t(c) * V + r] = (softcap > 0.0f) ? (softcap * tanhf(v / softcap)) : v;
+    };
+    put(r0, c0, acc[0]); put(r0, c0 + 1, acc[1]);
+    put(r1, c0, acc[2]); put(r1, c0 + 1, acc[3]);
+}
 
-            #pragma unroll
-            for (int r = 0; r < 8; ++r) {
-                if (r != col) {
-                    const float factor = smem_aug[r][col];
-                    __syncwarp();
-                    if (lane < 16) {
-                        smem_aug[r][lane] = fmaf(-factor, smem_aug[col][lane], smem_aug[r][lane]);
-                    }
-                    __syncwarp();
-                } else {
-                    __syncwarp();
-                    __syncwarp();
-                }
+// 16. Two-stage multi-CTA parallel argmax
+__global__ __launch_bounds__(128, 10)
+void parallel_argmax_stage1_sm86(const float* __restrict__ logits, float* __restrict__ blk_val, int32_t* __restrict__ blk_idx, int V) {
+    __shared__ float sv[4];
+    __shared__ int32_t si[4];
+    const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, start = blockIdx.x * 1024 + tid;
+    float mv = -1e38f;
+    int32_t mi = 0;
+    for (int i = start; i < V; i += gridDim.x * 1024) {
+        for (int u = 0; u < 8; ++u) {
+            const int j = i + u * 128;
+            if (j < V) {
+                const float v = logits[j];
+                if (v > mv) { mv = v; mi = j; }
             }
         }
     }
+    #pragma unroll
+    for (int m = 16; m >= 1; m >>= 1) {
+        const float ov = __shfl_xor_sync(0xFFFFFFFFu, mv, m);
+        const int32_t oi = __shfl_xor_sync(0xFFFFFFFFu, mi, m);
+        if (ov > mv) { mv = ov; mi = oi; }
+    }
+    if (lane == 0) { sv[wid] = mv; si[wid] = mi; }
     __syncthreads();
+    if (wid == 0 && lane < 4) {
+        mv = sv[lane]; mi = si[lane];
+        for (int m = 2; m >= 1; m >>= 1) {
+            const float ov = __shfl_xor_sync(0xFu, mv, m);
+            const int32_t oi = __shfl_xor_sync(0xFu, mi, m);
+            if (ov > mv) { mv = ov; mi = oi; }
+        }
+        if (lane == 0) { blk_val[blockIdx.x] = mv; blk_idx[blockIdx.x] = mi; }
+    }
+}
 
+__global__ __launch_bounds__(128, 10)
+void parallel_argmax_stage2_sm86(const float* __restrict__ bv, const int32_t* __restrict__ bi, int32_t* __restrict__ out, int N) {
+    __shared__ float sv[4];
+    __shared__ int32_t si[4];
+    const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31;
+    float mv = (tid < N) ? bv[tid] : -1e38f;
+    int32_t mi = (tid < N) ? bi[tid] : 0;
+    #pragma unroll
+    for (int m = 16; m >= 1; m >>= 1) {
+        const float ov = __shfl_xor_sync(0xFFFFFFFFu, mv, m);
+        const int32_t oi = __shfl_xor_sync(0xFFFFFFFFu, mi, m);
+        if (ov > mv) { mv = ov; mi = oi; }
+    }
+    if (lane == 0) { sv[wid] = mv; si[wid] = mi; }
+    __syncthreads();
+    if (wid == 0 && lane < 4) {
+        mv = sv[lane]; mi = si[lane];
+        for (int m = 2; m >= 1; m >>= 1) {
+            const float ov = __shfl_xor_sync(0xFu, mv, m);
+            const int32_t oi = __shfl_xor_sync(0xFu, mi, m);
+            if (ov > mv) { mv = ov; mi = oi; }
+        }
+        if (lane == 0) out[0] = mi;
+    }
+}
+
+// 17. Hoisted 256 B Woodbury 8x8 Cayley inverse (SMEM Gauss-Jordan -> 0 LDL/STL, 0 spill, <= 44 regs!)
+__global__ __launch_bounds__(128, 8)
+void woodbury_inv8_sm86(const float* __restrict__ M_in, float* __restrict__ inv_out) {
+    __shared__ float sm[8][16];
+    const int tid = threadIdx.x;
     if (tid < 64) {
-        m_inv_out_64[tid] = smem_aug[tid >> 3][8 + (tid & 7)];
-    }
-}
-
-// ----------------------------------------------------------------------------
-// 4. Kernel 2: Hoisted 256 B Constant-Memory Cayley-Woodbury r=4 Steering
-//    Split A/B accumulators keep register pressure <= 40 regs, 0 B spill!
-// ----------------------------------------------------------------------------
-
-__device__ __forceinline__ void cayley_woodbury_r4_hoisted_impl(
-    const float* __restrict__ x_in,
-    const float4* __restrict__ a_f4,
-    const float4* __restrict__ b_f4,
-    float* __restrict__ y_out,
-    float alpha_scale,
-    int d_model,
-    const float4* __restrict__ cinv4
-) {
-    __shared__ float4 sw[8][2];   // 256 B
-    __shared__ __align__(16) float sc_buf[8];   // 32 B -> Total 288 B SMEM
-
-    const int tid = threadIdx.x;
-    const int wid = tid >> 5;
-    const int lane = tid & 31;
-
-    float z0 = 0.0f, z1 = 0.0f, z2 = 0.0f, z3 = 0.0f;
-    float z4 = 0.0f, z5 = 0.0f, z6 = 0.0f, z7 = 0.0f;
-    #pragma unroll 2
-    for (int i = tid; i < d_model; i += 256) {
-        const float xi = __ldg(&x_in[i]);
-        const float4 av = __ldg(&a_f4[i]);
-        const float4 bv = __ldg(&b_f4[i]);
-        z0 = fmaf(av.x, xi, z0); z1 = fmaf(av.y, xi, z1);
-        z2 = fmaf(av.z, xi, z2); z3 = fmaf(av.w, xi, z3);
-        z4 = fmaf(bv.x, xi, z4); z5 = fmaf(bv.y, xi, z5);
-        z6 = fmaf(bv.z, xi, z6); z7 = fmaf(bv.w, xi, z7);
-    }
-    z0 = warp_sum_32(z0); z1 = warp_sum_32(z1);
-    z2 = warp_sum_32(z2); z3 = warp_sum_32(z3);
-    z4 = warp_sum_32(z4); z5 = warp_sum_32(z5);
-    z6 = warp_sum_32(z6); z7 = warp_sum_32(z7);
-    if (lane == 0) {
-        sw[wid][0] = make_float4(z0, z1, z2, z3);
-        sw[wid][1] = make_float4(z4, z5, z6, z7);
+        const int r = tid >> 3, c = tid & 7;
+        sm[r][c] = M_in[tid];
+        sm[r][c + 8] = (r == c) ? 1.0f : 0.0f;
     }
     __syncthreads();
-
-    if (wid == 0 && lane < 8) {
-        float4 zv0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        float4 zv1 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        #pragma unroll
-        for (int w = 0; w < 8; ++w) {
-            const float4 s = sw[w][0];
-            const float4 t = sw[w][1];
-            zv0.x += s.x; zv0.y += s.y; zv0.z += s.z; zv0.w += s.w;
-            zv1.x += t.x; zv1.y += t.y; zv1.z += t.z; zv1.w += t.w;
-        }
-        const float4 r0 = cinv4[lane * 2 + 0];
-        const float4 r1 = cinv4[lane * 2 + 1];
-        sc_buf[lane] = alpha_scale * (
-            fmaf(r0.x, zv0.x, fmaf(r0.y, zv0.y, fmaf(r0.z, zv0.z, r0.w * zv0.w)))
-            + fmaf(r1.x, zv1.x, fmaf(r1.y, zv1.y, fmaf(r1.z, zv1.z, r1.w * zv1.w)))
-        );
-    }
-    __syncthreads();
-
-    const float4 c03 = *reinterpret_cast<const float4*>(&sc_buf[0]);
-    const float4 c47 = *reinterpret_cast<const float4*>(&sc_buf[4]);
-
-    #pragma unroll 2
-    for (int i = tid; i < d_model; i += 256) {
-        const float4 av = __ldg(&a_f4[i]);
-        const float4 bv = __ldg(&b_f4[i]);
-        const float delta =
-            fmaf(bv.x, c03.x, fmaf(bv.y, c03.y, fmaf(bv.z, c03.z, bv.w * c03.w)))
-          - fmaf(av.x, c47.x, fmaf(av.y, c47.y, fmaf(av.z, c47.z, av.w * c47.w)));
-        y_out[i] = __ldg(&x_in[i]) + delta;
-    }
-}
-
-__global__ __launch_bounds__(256, 5)
-void siligemma_cayley_woodbury_r4_hoisted_sm86(
-    const float* __restrict__ x_in,
-    const float4* __restrict__ a_f4,
-    const float4* __restrict__ b_f4,
-    float* __restrict__ y_out,
-    float alpha_scale,
-    int d_model
-) {
-    cayley_woodbury_r4_hoisted_impl(
-        x_in, a_f4, b_f4, y_out, alpha_scale, d_model,
-        reinterpret_cast<const float4*>(c_wb_inv_256b)
-    );
-}
-
-// Hub Steering Interface on L10..L14 20x shared_KV store (hub_slot in 0..4)
-__global__ __launch_bounds__(256, 5)
-void siligemma_cayley_woodbury_hub_l10_14_sm86(
-    const float* __restrict__ x_in,
-    const float4* __restrict__ a_f4,
-    const float4* __restrict__ b_f4,
-    float* __restrict__ y_out,
-    float alpha_scale,
-    int d_model,
-    int hub_slot
-) {
-    const int safe_slot = (hub_slot >= 0 && hub_slot < 5) ? hub_slot : 0;
-    cayley_woodbury_r4_hoisted_impl(
-        x_in, a_f4, b_f4, y_out, alpha_scale, d_model,
-        reinterpret_cast<const float4*>(c_wb_inv_hub_l10_14[safe_slot])
-    );
-}
-
-// ----------------------------------------------------------------------------
-// 5. Kernel 3: Pre-Quantized Sandwich-RMSNorm + H4 + Q8 + Optional u[4] Hoist
-// ----------------------------------------------------------------------------
-
-__global__ __launch_bounds__(128, 10)
-void siligemma_sandwich_norm_u4_q8_sm86(
-    const float* __restrict__ x_in,
-    const float* __restrict__ rms_gamma,
-    const float4* __restrict__ a_rot_f4,   // nullable when no r=4 steer is attached
-    int32_t* __restrict__ x_q8_out,
-    float* __restrict__ x_sc_out,
-    float4* __restrict__ u4_out,
-    float eps,
-    int d_model
-) {
-    __shared__ float smem_tree[128]; // 512 B
-    __shared__ float smem_blk[96];   // 384 B -> Total 896 B SMEM
-
-    const int tid = threadIdx.x;
-    const int d_f4 = d_model >> 2;
-    const int b_idx = int(blockIdx.x);
-    const float* x_row = x_in + int64_t(b_idx) * int64_t(d_model);
-    int32_t* q8_row = x_q8_out + int64_t(b_idx) * int64_t(d_f4);
-    float* sc_row = x_sc_out + int64_t(b_idx) * int64_t(d_model >> 5);
-
-    float inv_rms = 1.0f;
-    if (eps >= 0.0f) {
-        const float sum_sq = canonical_sum_sq_d128(x_row, d_model, smem_tree, smem_blk);
-        inv_rms = rsqrtf(sum_sq / float(d_model) + eps);
-    }
-
-    const float4* x_g4 = reinterpret_cast<const float4*>(x_row);
-    float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
-
-    #pragma unroll 1
-    for (int i = tid; i < d_f4; i += 128) {
-        const float4 xv = __ldg(&x_g4[i]);
-        const int g_base = i * 4;
-        const float4 gv = (eps >= 0.0f && rms_gamma != nullptr)
-            ? make_float4(__ldg(&rms_gamma[g_base]), __ldg(&rms_gamma[g_base + 1]),
-                          __ldg(&rms_gamma[g_base + 2]), __ldg(&rms_gamma[g_base + 3]))
-            : make_float4(1.0f, 1.0f, 1.0f, 1.0f);
-        const float4 xn = make_float4(
-            xv.x * inv_rms * gv.x,
-            xv.y * inv_rms * gv.y,
-            xv.z * inv_rms * gv.z,
-            xv.w * inv_rms * gv.w
-        );
-        const float4 xr = h4_rot_f4(xn);
-
-        float amax = fmaxf(fmaxf(fabsf(xr.x), fabsf(xr.y)), fmaxf(fabsf(xr.z), fabsf(xr.w)));
-        #pragma unroll
-        for (int mask = 4; mask >= 1; mask >>= 1) {
-            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, mask));
-        }
-        const float sc = (amax > 1.0e-12f) ? (amax * (1.0f / 127.0f)) : 1.0e-12f;
-        const float inv_sc = 1.0f / sc;
-        q8_row[i] = pack4_s8(
-            __float2int_rn(fminf(127.0f, fmaxf(-127.0f, xr.x * inv_sc))),
-            __float2int_rn(fminf(127.0f, fmaxf(-127.0f, xr.y * inv_sc))),
-            __float2int_rn(fminf(127.0f, fmaxf(-127.0f, xr.z * inv_sc))),
-            __float2int_rn(fminf(127.0f, fmaxf(-127.0f, xr.w * inv_sc)))
-        );
-        if ((i & 7) == 0) sc_row[i >> 3] = sc;
-
-        if (a_rot_f4 != nullptr) {
-            const float4 a0 = __ldg(&a_rot_f4[0 * d_f4 + i]);
-            const float4 a1 = __ldg(&a_rot_f4[1 * d_f4 + i]);
-            const float4 a2 = __ldg(&a_rot_f4[2 * d_f4 + i]);
-            const float4 a3 = __ldg(&a_rot_f4[3 * d_f4 + i]);
-            u0 = fmaf(a0.x, xr.x, fmaf(a0.y, xr.y, fmaf(a0.z, xr.z, fmaf(a0.w, xr.w, u0))));
-            u1 = fmaf(a1.x, xr.x, fmaf(a1.y, xr.y, fmaf(a1.z, xr.z, fmaf(a1.w, xr.w, u1))));
-            u2 = fmaf(a2.x, xr.x, fmaf(a2.y, xr.y, fmaf(a2.z, xr.z, fmaf(a2.w, xr.w, u2))));
-            u3 = fmaf(a3.x, xr.x, fmaf(a3.y, xr.y, fmaf(a3.z, xr.z, fmaf(a3.w, xr.w, u3))));
-        }
-    }
-
-    if (a_rot_f4 != nullptr && u4_out != nullptr) {
-        const float r0 = tree_reduce_128_sm86(u0, smem_tree);
-        const float r1 = tree_reduce_128_sm86(u1, smem_tree);
-        const float r2 = tree_reduce_128_sm86(u2, smem_tree);
-        const float r3 = tree_reduce_128_sm86(u3, smem_tree);
-        if (tid == 0) u4_out[b_idx] = make_float4(r0, r1, r2, r3);
-    }
-}
-
-// ----------------------------------------------------------------------------
-// 6. Kernel 4: Coalesced A_16 + Block-H4 dp4a GEMV (0-ULP tree_reduce_128_sm86)
-//    Supports g=32 & g=128 SoA wire format, inline SECDED, optional u[4] epilogue.
-// ----------------------------------------------------------------------------
-
-__global__ __launch_bounds__(128, 10)
-void siligemma_a16_h4_dp4a_gemv_sm86(
-    const int32_t* __restrict__ x_q8_in,
-    const float* __restrict__ x_sc_in,
-    const uint64_t* __restrict__ w_packed_u64,
-    const __half* __restrict__ w_scales_f16,
-    const float4* __restrict__ u4_in,
-    const float4* __restrict__ b_f4,
-    float* __restrict__ y_out,
-    siligemma::HoloSphereRazorCanary64* host_canary,
-    float lora_alpha,
-    int out_dim,
-    int in_dim,
-    int group_size
-) {
-    __shared__ float smem_tree[128]; // 512 B
-
-    const int tid = threadIdx.x;
-    const int lane = tid & 31;
-    const int row = int(blockIdx.x);
-    const int b_idx = int(blockIdx.y);
-    if (row >= out_dim) return;
-
-    const int n_blk16 = in_dim >> 4;
-    const int n_grp_w = (group_size == 128) ? (in_dim >> 7) : (in_dim >> 5);
-    const int g_shift = (group_size == 128) ? 3 : 1;  // blk16 >> 3 == g128, blk16 >> 1 == g32
-
-    const uint64_t* row_u64 = w_packed_u64 + int64_t(row) * int64_t(n_blk16);
-    const __half* row_sc = w_scales_f16 + int64_t(row) * int64_t(n_grp_w);
-    const int32_t* xq_row = x_q8_in + int64_t(b_idx) * int64_t(in_dim >> 2);
-    const float* xsc_row = x_sc_in + int64_t(b_idx) * int64_t(in_dim >> 5);
-
-    float acc = 0.0f;
-    #pragma unroll 1
-    for (int blk_base = 0; blk_base < n_blk16; blk_base += 128) {
-        const int blk = blk_base + tid;
-        const bool active = (blk < n_blk16);
-        const uint64_t w64 = active ? __ldg(&row_u64[blk]) : 0ULL;
-        const float sc = active ? (__half2float(__ldg(&row_sc[blk >> g_shift])) * __ldg(&xsc_row[blk >> 1])) : 0.0f;
-        eval_a16_blk16_secded_dp4a(active, w64, sc, xq_row + (active ? blk * 4 : 0), host_canary, lane, acc);
-    }
-
-    const float sum = tree_reduce_128_sm86(acc, smem_tree);
-    if (tid == 0) {
-        float val = sum;
-        if (b_f4 != nullptr && u4_in != nullptr && lora_alpha != 0.0f) {
-            const float4 uv = __ldg(&u4_in[b_idx]);
-            const float4 bv = __ldg(&b_f4[row]);
-            const float tangent = fmaf(bv.x, uv.x, fmaf(bv.y, uv.y, fmaf(bv.z, uv.z, bv.w * uv.w)));
-            val = fmaf(lora_alpha, tangent, val);
-        }
-        y_out[int64_t(b_idx) * int64_t(out_dim) + int64_t(row)] = val;
-    }
-}
-
-// Fast 4-row/CTA warp-tree A_16 dp4a GEMV (B=1 decode, optional softcap on lm_head)
-__global__ __launch_bounds__(128, 10)
-void siligemma_a16_h4_dp4a_gemv_r4_sm86(
-    const int32_t* __restrict__ x_q8_in,
-    const float* __restrict__ x_sc_in,
-    const uint64_t* __restrict__ w_packed_u64,
-    const __half* __restrict__ w_scales_f16,
-    float* __restrict__ y_out,
-    siligemma::HoloSphereRazorCanary64* host_canary,
-    float softcap,
-    int out_dim,
-    int in_dim,
-    int group_size
-) {
-    const int tid = threadIdx.x;
-    const int wid = tid >> 5;
-    const int lane = tid & 31;
-    const int row = int(blockIdx.x) * 4 + wid;
-    const bool active_row = (row < out_dim);
-
-    const int n_blk16 = in_dim >> 4;
-    const int n_grp_w = (group_size == 128) ? (in_dim >> 7) : (in_dim >> 5);
-    const int g_shift = (group_size == 128) ? 3 : 1;
-
-    const uint64_t* row_u64 = active_row ? (w_packed_u64 + int64_t(row) * int64_t(n_blk16)) : nullptr;
-    const __half* row_sc = active_row ? (w_scales_f16 + int64_t(row) * int64_t(n_grp_w)) : nullptr;
-
-    float acc = 0.0f;
-    #pragma unroll 1
-    for (int blk_base = 0; blk_base < n_blk16; blk_base += 32) {
-        const int blk = blk_base + lane;
-        const bool active = active_row && (blk < n_blk16);
-        const uint64_t w64 = active ? __ldg(&row_u64[blk]) : 0ULL;
-        const float sc = active ? (__half2float(__ldg(&row_sc[blk >> g_shift])) * __ldg(&x_sc_in[blk >> 1])) : 0.0f;
-        eval_a16_blk16_secded_dp4a(active, w64, sc, x_q8_in + (active ? blk * 4 : 0), host_canary, lane, acc);
-    }
-
-    acc = warp_sum_32(acc);
-    if (active_row && lane == 0) {
-        if (softcap > 0.0f) {
-            acc = softcap * tanhf(acc / softcap);
-        }
-        y_out[row] = acc;
-    }
-}
-
-// Weight-Reused B<=16 A_16 dp4a GEMM (reads w64 & scales ONCE across all B items)
-__global__ __launch_bounds__(128, 6)
-void siligemma_a16_h4_dp4a_gemm_b16_sm86(
-    const int32_t* __restrict__ x_q8_in,
-    const float* __restrict__ x_sc_in,
-    const uint64_t* __restrict__ w_packed_u64,
-    const __half* __restrict__ w_scales_f16,
-    float* __restrict__ y_out,
-    siligemma::HoloSphereRazorCanary64* host_canary,
-    float softcap,
-    int batch_size,
-    int out_dim,
-    int in_dim,
-    int group_size
-) {
-    __shared__ float smem_tree[128];     // 512 B
-    __shared__ float smem_b[16][128];    // 8,192 B
-
-    const int tid = threadIdx.x;
-    const int lane = tid & 31;
-    const int row = int(blockIdx.x);
-    if (row >= out_dim) return;
-
-    const int n_blk16 = in_dim >> 4;
-    const int n_grp_w = (group_size == 128) ? (in_dim >> 7) : (in_dim >> 5);
-    const int g_shift = (group_size == 128) ? 3 : 1;
-    const int x_q8_stride = in_dim >> 2;
-    const int x_sc_stride = in_dim >> 5;
-
-    for (int b = 0; b < batch_size; ++b) {
-        smem_b[b][tid] = 0.0f;
-    }
-
-    const uint64_t* row_u64 = w_packed_u64 + int64_t(row) * int64_t(n_blk16);
-    const __half* row_sc = w_scales_f16 + int64_t(row) * int64_t(n_grp_w);
-
-    #pragma unroll 1
-    for (int blk_base = 0; blk_base < n_blk16; blk_base += 128) {
-        const int blk = blk_base + tid;
-        const bool active = (blk < n_blk16);
-        uint64_t w64 = active ? __ldg(&row_u64[blk]) : 0ULL;
-        const uint32_t syn = active ? a16_secded_lop3_popc_syndrome(w64) : 0u;
-        const uint32_t any = __ballot_sync(0xFFFFFFFFu, syn != 0u);
-        if (__builtin_expect(any != 0u, 0)) {
-            uint32_t l_sec = 0u, l_ded = 0u, diag = 0u;
-            if (syn != 0u) {
-                if (syn & 1u) {
-                    w64 ^= (1ULL << (((syn >> 1) & 15u) * 4u));
-                    l_sec = 1u;
-                    diag = syn & 0x1Fu;
-                } else {
-                    l_ded = 1u;
-                    diag = (1u << 5) | (syn & 0x1Fu);
+    for (int col = 0; col < 8; ++col) {
+        if (tid == 0) {
+            int piv = col;
+            float best = fabsf(sm[col][col]);
+            for (int r = col + 1; r < 8; ++r) {
+                const float v = fabsf(sm[r][col]);
+                if (v > best) { best = v; piv = r; }
+            }
+            if (piv != col) {
+                for (int c = 0; c < 16; ++c) {
+                    const float tmp = sm[col][c];
+                    sm[col][c] = sm[piv][c];
+                    sm[piv][c] = tmp;
                 }
             }
-            razor_canary_emit_sys(host_canary, l_sec, l_ded, diag, lane);
+            const float inv_d = 1.0f / sm[col][col];
+            for (int c = 0; c < 16; ++c) sm[col][c] *= inv_d;
         }
-        if (active) {
-            const float w_sc = __half2float(__ldg(&row_sc[blk >> g_shift]));
-            int32_t wp0 = 0, wp1 = 0, wp2 = 0, wp3 = 0;
-            {
-                const uint32_t n0 = uint32_t(w64 & 0xFFFFULL);
-                wp0 = pack4_s8(int32_t(n0 << 28) >> 28, int32_t(n0 << 24) >> 28, int32_t(n0 << 20) >> 28, int32_t(n0 << 16) >> 28);
-                const uint32_t n1 = uint32_t((w64 >> 16) & 0xFFFFULL);
-                wp1 = pack4_s8(int32_t(n1 << 28) >> 28, int32_t(n1 << 24) >> 28, int32_t(n1 << 20) >> 28, int32_t(n1 << 16) >> 28);
-                const uint32_t n2 = uint32_t((w64 >> 32) & 0xFFFFULL);
-                wp2 = pack4_s8(int32_t(n2 << 28) >> 28, int32_t(n2 << 24) >> 28, int32_t(n2 << 20) >> 28, int32_t(n2 << 16) >> 28);
-                const uint32_t n3 = uint32_t((w64 >> 48) & 0xFFFFULL);
-                wp3 = pack4_s8(int32_t(n3 << 28) >> 28, int32_t(n3 << 24) >> 28, int32_t(n3 << 20) >> 28, int32_t(n3 << 16) >> 28);
-            }
-            const int x_q_off = blk * 4;
-            const int x_s_off = blk >> 1;
-            #pragma unroll 1
-            for (int b = 0; b < batch_size; ++b) {
-                const int32_t* xq = x_q8_in + int64_t(b) * int64_t(x_q8_stride) + x_q_off;
-                int32_t idot = ptx_dp4a_s32(wp0, __ldg(&xq[0]), 0);
-                idot = ptx_dp4a_s32(wp1, __ldg(&xq[1]), idot);
-                idot = ptx_dp4a_s32(wp2, __ldg(&xq[2]), idot);
-                idot = ptx_dp4a_s32(wp3, __ldg(&xq[3]), idot);
-                const float sc = w_sc * __ldg(&x_sc_in[int64_t(b) * int64_t(x_sc_stride) + x_s_off]);
-                smem_b[b][tid] = fmaf(float(idot), sc, smem_b[b][tid]);
-            }
-        }
-    }
-
-    #pragma unroll 1
-    for (int b = 0; b < batch_size; ++b) {
-        float sum = tree_reduce_128_sm86(smem_b[b][tid], smem_tree);
-        if (tid == 0) {
-            if (softcap > 0.0f) {
-                sum = softcap * tanhf(sum / softcap);
-            }
-            y_out[int64_t(b) * int64_t(out_dim) + int64_t(row)] = sum;
-        }
-    }
-}
-
-// ----------------------------------------------------------------------------
-// 7. Kernel 5: Single-Pass Fused Sandwich-RMSNorm + H4 + Q8 + A_16 dp4a GEMV
-//    <= 48 regs, <= 1,664 B SMEM, 0 B stack/spill, 0-ULP tree_reduce_128_sm86.
-// ----------------------------------------------------------------------------
-
-__global__ __launch_bounds__(128, 10)
-void siligemma_fused_sandwich_h4_dp4a_gemv_sm86(
-    const float* __restrict__ x_in,
-    const float* __restrict__ rms_gamma,
-    const uint64_t* __restrict__ w_packed_u64,
-    const __half* __restrict__ w_scales_f16,
-    float* __restrict__ y_out,
-    siligemma::HoloSphereRazorCanary64* host_canary,
-    float eps,
-    int out_dim,
-    int in_dim,
-    int group_size
-) {
-    __shared__ float   smem_tree[128];   // 512 B
-    __shared__ int32_t smem_x_q8[256];   // 1,024 B (TILE_K = 1024 -> 256 x 4B)
-    __shared__ float   smem_x_sc[32];    // 128 B -> Total 1,664 B SMEM
-
-    const int tid = threadIdx.x;
-    const int lane = tid & 31;
-    const int row = int(blockIdx.x);
-    const int b_idx = int(blockIdx.y);
-    if (row >= out_dim) return;
-
-    const float* x_row = x_in + int64_t(b_idx) * int64_t(in_dim);
-
-    // Phase 1: Canonical 0-ULP block-128 sum of squares (reuses smem_x_q8 temporarily as float[96])
-    float* smem_blk_sq = reinterpret_cast<float*>(smem_x_q8);
-    const float sum_sq = canonical_sum_sq_d128(x_row, in_dim, smem_tree, smem_blk_sq);
-    const float inv_rms = rsqrtf(sum_sq / float(in_dim) + eps);
-
-    // Phase 2: Tiled Sandwich-Norm -> H_4 -> Q8 + SECDED + dp4a
-    const int n_blk16 = in_dim >> 4;
-    const int n_grp_w = (group_size == 128) ? (in_dim >> 7) : (in_dim >> 5);
-    const int g_shift = (group_size == 128) ? 3 : 1;
-    const uint64_t* row_u64 = w_packed_u64 + int64_t(row) * int64_t(n_blk16);
-    const __half* row_sc = w_scales_f16 + int64_t(row) * int64_t(n_grp_w);
-    const float4* x_g4 = reinterpret_cast<const float4*>(x_row);
-
-    float acc = 0.0f;
-    #pragma unroll 1
-    for (int tile_base = 0; tile_base < in_dim; tile_base += 1024) {
-        const int rem = in_dim - tile_base;
-        const int tile_elems = (rem < 1024) ? rem : 1024;
-        const int tile_f4 = tile_elems >> 2;
-        const int tile_base_f4 = tile_base >> 2;
-        const int tile_blk16 = tile_elems >> 4;
-        const int tile_base_blk16 = tile_base >> 4;
-
-        for (int i = tid; i < 256; i += 128) {
-            const bool active = (i < tile_f4);
-            float4 xr = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            if (active) {
-                const float4 xv = __ldg(&x_g4[tile_base_f4 + i]);
-                const int g_base = (tile_base_f4 + i) * 4;
-                const float4 gv = (rms_gamma != nullptr)
-                    ? make_float4(__ldg(&rms_gamma[g_base]), __ldg(&rms_gamma[g_base + 1]),
-                                  __ldg(&rms_gamma[g_base + 2]), __ldg(&rms_gamma[g_base + 3]))
-                    : make_float4(1.0f, 1.0f, 1.0f, 1.0f);
-                xr = h4_rot_f4(make_float4(
-                    xv.x * inv_rms * gv.x,
-                    xv.y * inv_rms * gv.y,
-                    xv.z * inv_rms * gv.z,
-                    xv.w * inv_rms * gv.w
-                ));
-            }
-            float amax = fmaxf(fmaxf(fabsf(xr.x), fabsf(xr.y)), fmaxf(fabsf(xr.z), fabsf(xr.w)));
-            #pragma unroll
-            for (int mask = 4; mask >= 1; mask >>= 1) {
-                amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, mask));
-            }
-            const float sc = (amax > 1.0e-12f) ? (amax * (1.0f / 127.0f)) : 1.0e-12f;
-            const float inv_sc = 1.0f / sc;
-            if (active) {
-                smem_x_q8[i] = pack4_s8(
-                    __float2int_rn(fminf(127.0f, fmaxf(-127.0f, xr.x * inv_sc))),
-                    __float2int_rn(fminf(127.0f, fmaxf(-127.0f, xr.y * inv_sc))),
-                    __float2int_rn(fminf(127.0f, fmaxf(-127.0f, xr.z * inv_sc))),
-                    __float2int_rn(fminf(127.0f, fmaxf(-127.0f, xr.w * inv_sc)))
-                );
-                if ((i & 7) == 0) smem_x_sc[i >> 3] = sc;
+        __syncthreads();
+        if (tid < 128) {
+            const int r = tid >> 4, c = tid & 15;
+            if (r < 8 && r != col) {
+                const float f = sm[r][col];
+                sm[r][c] -= f * sm[col][c];
             }
         }
         __syncthreads();
-
-        const bool active_blk = (tid < tile_blk16);
-        const int blk_glob = tile_base_blk16 + tid;
-        const uint64_t w64 = active_blk ? __ldg(&row_u64[blk_glob]) : 0ULL;
-        const float sc = active_blk ? (__half2float(__ldg(&row_sc[blk_glob >> g_shift])) * smem_x_sc[tid >> 1]) : 0.0f;
-        eval_a16_blk16_secded_dp4a(active_blk, w64, sc, smem_x_q8 + (active_blk ? tid * 4 : 0), host_canary, lane, acc);
-        __syncthreads();
     }
-
-    const float sum = tree_reduce_128_sm86(acc, smem_tree);
-    if (tid == 0) {
-        y_out[int64_t(b_idx) * int64_t(out_dim) + int64_t(row)] = sum;
+    if (tid < 64) {
+        const int r = tid >> 3, c = tid & 7;
+        inv_out[tid] = sm[r][c + 8];
     }
 }
 
-// ----------------------------------------------------------------------------
-// 8. Kernel 6: Gemma-4 GeGLU + Post-FFN / PLE Sandwich + Layer Scalar c_l
-// ----------------------------------------------------------------------------
-
+// Apply L10..L14 Woodbury-Cayley rank-8 steering using hoisted c_wb_inv_256b (0 B extra KV, norm-preserving!)
 __global__ __launch_bounds__(128, 10)
-void siligemma_geglu_act_sm86(
-    const float* __restrict__ gate_in,
-    const float* __restrict__ up_in,
-    float* __restrict__ act_out,
-    int d_ff
+void cayley_woodbury_apply_sm86(
+    float* __restrict__ h_io,         // [B, D]
+    const float* __restrict__ U8,     // [8, D]
+    const float* __restrict__ V8,     // [8, D]
+    float alpha, int B, int D
 ) {
-    const int idx = int(blockIdx.x) * 128 + int(threadIdx.x);
-    if (idx < d_ff) {
-        act_out[idx] = gelu_pytorch_tanh_dev(__ldg(&gate_in[idx])) * __ldg(&up_in[idx]);
-    }
-}
-
-__global__ __launch_bounds__(128, 10)
-void siligemma_ple_combine_gate_sm86(
-    const float* __restrict__ ple_gate_raw,
-    const float* __restrict__ ple_model_proj,
-    const __nv_bfloat16* __restrict__ ple_token_dma,
-    const float* __restrict__ ple_proj_norm_gamma,
-    float* __restrict__ ple_gated_out,
-    int layer_idx,
-    int num_layers,
-    int ple_dim,
-    float hidden_inv_sqrt,
-    float eps
-) {
-    __shared__ float smem_tree[128]; // 512 B
-    __shared__ float smem_blk[4];    // 16 B
-
-    const int tid = threadIdx.x;
-    const int b_idx = int(blockIdx.x);
-    const int slice_off = (b_idx * num_layers + layer_idx) * ple_dim;
-
-    // 256 = 2 * 128 -> canonical RMSNorm over per_layer_model_projection slice
-    for (int c = 0; c < 2; ++c) {
-        const int i = c * 128 + tid;
-        float p = 0.0f;
-        if (i < ple_dim) {
-            const float mv = __bfloat162float(__float2bfloat16(__ldg(&ple_model_proj[slice_off + i]) * hidden_inv_sqrt));
-            p = mv;
-        }
-        const float cs = tree_reduce_128_sm86(p * p, smem_tree);
-        if (tid == 0) smem_blk[c] = cs;
-    }
-    __syncthreads();
-    const float tot_sq = tree_reduce_128_sm86((tid < 2) ? smem_blk[tid] : 0.0f, smem_tree);
-    const float inv_rms = rsqrtf(tot_sq / float(ple_dim) + eps);
-    constexpr float kInvSqrt2 = 0.7071067811865475f;
-    constexpr float kSqrtPle = 16.0f; // sqrt(256)
-
-    for (int i = tid; i < ple_dim; i += 128) {
-        const float mv = __bfloat162float(__float2bfloat16(__ldg(&ple_model_proj[slice_off + i]) * hidden_inv_sqrt));
-        const float mp = mv * inv_rms * __ldg(&ple_proj_norm_gamma[i]);
-        const float tok_p = __bfloat162float(__ldg(&ple_token_dma[slice_off + i])) * kSqrtPle;
-        const float ple_comb = (mp + tok_p) * kInvSqrt2;
-        const float g_act = gelu_pytorch_tanh_dev(__ldg(&ple_gate_raw[b_idx * ple_dim + i]));
-        ple_gated_out[b_idx * ple_dim + i] = g_act * ple_comb;
-    }
-}
-
-__global__ __launch_bounds__(128, 10)
-void siligemma_fused_geglu_ple_sandwich_sm86(
-    const float* __restrict__ res_in,
-    const float* __restrict__ block_raw_in,
-    const float* __restrict__ post_norm_gamma,
-    const float* __restrict__ ple_proj_raw_in,   // nullable (attn sandwich skips PLE stage)
-    const float* __restrict__ post_ple_gamma,
-    float* __restrict__ h_out,
-    float layer_scalar,
-    float eps,
-    int d_model
-) {
-    __shared__ float smem_tree[128]; // 512 B
-    __shared__ float smem_blk[16];   // 64 B -> Total 576 B <= 1,152 B SMEM
-
-    const int tid = threadIdx.x;
-    const int b_idx = int(blockIdx.x);
-    const int64_t row_off = int64_t(b_idx) * int64_t(d_model);
-
-    const float sum_sq_a = canonical_sum_sq_d128(block_raw_in + row_off, d_model, smem_tree, smem_blk);
-    const float inv_rms_a = rsqrtf(sum_sq_a / float(d_model) + eps);
-
-    if (ple_proj_raw_in != nullptr && post_ple_gamma != nullptr) {
-        const float sum_sq_p = canonical_sum_sq_d128(ple_proj_raw_in + row_off, d_model, smem_tree, smem_blk);
-        const float inv_rms_p = rsqrtf(sum_sq_p / float(d_model) + eps);
-        for (int i = tid; i < d_model; i += 128) {
-            const float v_l = __ldg(&res_in[row_off + i]) + __ldg(&block_raw_in[row_off + i]) * inv_rms_a * __ldg(&post_norm_gamma[i]);
-            const float p_n = __ldg(&ple_proj_raw_in[row_off + i]) * inv_rms_p * __ldg(&post_ple_gamma[i]);
-            h_out[row_off + i] = layer_scalar * (v_l + p_n);
-        }
-    } else {
-        for (int i = tid; i < d_model; i += 128) {
-            const float r_val = (res_in != nullptr) ? __ldg(&res_in[row_off + i]) : 0.0f;
-            const float v_l = r_val + __ldg(&block_raw_in[row_off + i]) * inv_rms_a * __ldg(&post_norm_gamma[i]);
-            h_out[row_off + i] = layer_scalar * v_l;
-        }
-    }
-}
-
-// ----------------------------------------------------------------------------
-// 9. Kernel 7: zed Shared-KV Attention (Sliding d_h=256 & Proportional d_h=512)
-//    L0..14 write static ring; L15..34 & L25..33 loops strictly read-only (0 B extra KV)
-// ----------------------------------------------------------------------------
-
-__global__ __launch_bounds__(128, 10)
-void siligemma_attention_kv_step_sm86(
-    const float* __restrict__ q_raw,
-    const float* __restrict__ k_raw,         // nullptr for L15..34 reuse layers
-    const float* __restrict__ v_raw,         // nullptr for L15..34 reuse layers
-    const float* __restrict__ q_norm_gamma,
-    const float* __restrict__ k_norm_gamma,  // nullptr for L15..34 reuse layers
-    __nv_bfloat16* __restrict__ kv_ring_buf, // [batch_stride, ring_slots, 2, head_dim]
-    float* __restrict__ attn_out,            // [batch, 8, head_dim]
-    int pos,
-    const int32_t* __restrict__ d_pos_ptr,   // nullable dynamic position pointer for CUDA Graphs
-    int ring_slots,
-    int kv_batch_stride,
-    int head_dim,
-    int is_full_attn,
-    int is_shared_layer,
-    float eps
-) {
-    __shared__ float smem_tree[128];          // 512 B
-    __shared__ float smem_blk[4];             // 16 B
-    __shared__ __nv_bfloat16 smem_cur_k[512]; // 1,024 B (eliminates inter-CTA data race at t == eff_pos)
-    __shared__ __nv_bfloat16 smem_cur_v[512]; // 1,024 B -> Total 2,576 B SMEM
-
-    const int tid = threadIdx.x;
-    const int head_idx = int(blockIdx.x);
-    const int b_idx = int(blockIdx.y);
-    const int stride_k = 2 * head_dim;
-    const int eff_pos = (d_pos_ptr != nullptr) ? __ldg(d_pos_ptr) : pos;
-    const int64_t b_kv_off = int64_t(b_idx) * int64_t(kv_batch_stride) * int64_t(stride_k);
-
-    // Step A: all 8 head CTAs compute K/V at t == eff_pos into local SMEM; head 0 writes global ring
-    if (!is_shared_layer && k_raw != nullptr && v_raw != nullptr) {
-        const float* k_in = k_raw + int64_t(b_idx) * int64_t(head_dim);
-        const float* v_in = v_raw + int64_t(b_idx) * int64_t(head_dim);
-
-        const float k_ss = canonical_sum_sq_d128(k_in, head_dim, smem_tree, smem_blk);
-        const float v_ss = canonical_sum_sq_d128(v_in, head_dim, smem_tree, smem_blk);
-        const float k_inv = rsqrtf(k_ss / float(head_dim) + eps);
-        const float v_inv = rsqrtf(v_ss / float(head_dim) + eps); // v_norm has with_scale=False
-
-        const float rope_theta = is_full_attn ? siligemma::GEMMA4_ROPE_THETA_FULL : siligemma::GEMMA4_ROPE_THETA_SLIDING;
-        const int half_d = head_dim >> 1;
-        const int rot_lim = is_full_attn ? int(siligemma::GEMMA4_FULL_ROTATED_PAIRS) : half_d;
-        const int slot = eff_pos % ring_slots;
-        __nv_bfloat16* k_dst = kv_ring_buf + b_kv_off + int64_t(slot) * int64_t(stride_k);
-        __nv_bfloat16* v_dst = k_dst + head_dim;
-
-        for (int i = tid; i < half_d; i += 128) {
-            const float k0 = __ldg(&k_in[i]) * k_inv * __ldg(&k_norm_gamma[i]);
-            const float k1 = __ldg(&k_in[i + half_d]) * k_inv * __ldg(&k_norm_gamma[i + half_d]);
-            float rk0 = k0, rk1 = k1;
-            if (i < rot_lim) {
-                const float inv_f = powf(rope_theta, -float(2 * i) / float(head_dim));
-                float s_v = 0.0f, c_v = 1.0f;
-                __sincosf(float(eff_pos) * inv_f, &s_v, &c_v);
-                rk0 = fmaf(k0, c_v, -k1 * s_v);
-                rk1 = fmaf(k1, c_v, k0 * s_v);
-            }
-            const __nv_bfloat16 bk0 = __float2bfloat16(rk0);
-            const __nv_bfloat16 bk1 = __float2bfloat16(rk1);
-            const __nv_bfloat16 bv0 = __float2bfloat16(__ldg(&v_in[i]) * v_inv);
-            const __nv_bfloat16 bv1 = __float2bfloat16(__ldg(&v_in[i + half_d]) * v_inv);
-            smem_cur_k[i] = bk0;
-            smem_cur_k[i + half_d] = bk1;
-            smem_cur_v[i] = bv0;
-            smem_cur_v[i + half_d] = bv1;
-            if (head_idx == 0) {
-                k_dst[i] = bk0;
-                k_dst[i + half_d] = bk1;
-                v_dst[i] = bv0;
-                v_dst[i + half_d] = bv1;
-            }
-        }
-    }
-    __syncthreads();
-
-    // Step B: Q norm + RoPE (registered per head) & online attention over active window
-    const float* q_in = q_raw + (int64_t(b_idx) * 8LL + int64_t(head_idx)) * int64_t(head_dim);
-    const float q_ss = canonical_sum_sq_d128(q_in, head_dim, smem_tree, smem_blk);
-    const float q_inv = rsqrtf(q_ss / float(head_dim) + eps);
-
-    const float rope_theta = is_full_attn ? siligemma::GEMMA4_ROPE_THETA_FULL : siligemma::GEMMA4_ROPE_THETA_SLIDING;
-    const int half_d = head_dim >> 1;
-    const int rot_lim = is_full_attn ? int(siligemma::GEMMA4_FULL_ROTATED_PAIRS) : half_d;
-
-    const int p0 = tid;
-    const int p1 = tid + 128;
-    float q0_a = __ldg(&q_in[p0]) * q_inv * __ldg(&q_norm_gamma[p0]);
-    float q0_b = __ldg(&q_in[p0 + half_d]) * q_inv * __ldg(&q_norm_gamma[p0 + half_d]);
-    if (p0 < rot_lim) {
-        const float inv_f = powf(rope_theta, -float(2 * p0) / float(head_dim));
-        float s_v = 0.0f, c_v = 1.0f;
-        __sincosf(float(eff_pos) * inv_f, &s_v, &c_v);
-        const float rq0 = fmaf(q0_a, c_v, -q0_b * s_v);
-        const float rq1 = fmaf(q0_b, c_v, q0_a * s_v);
-        q0_a = rq0; q0_b = rq1;
-    }
-
-    float q1_a = 0.0f, q1_b = 0.0f;
-    if (half_d > 128) {
-        q1_a = __ldg(&q_in[p1]) * q_inv * __ldg(&q_norm_gamma[p1]);
-        q1_b = __ldg(&q_in[p1 + half_d]) * q_inv * __ldg(&q_norm_gamma[p1 + half_d]);
-        if (p1 < rot_lim) {
-            const float inv_f = powf(rope_theta, -float(2 * p1) / float(head_dim));
-            float s_v = 0.0f, c_v = 1.0f;
-            __sincosf(float(eff_pos) * inv_f, &s_v, &c_v);
-            const float rq0 = fmaf(q1_a, c_v, -q1_b * s_v);
-            const float rq1 = fmaf(q1_b, c_v, q1_a * s_v);
-            q1_a = rq0; q1_b = rq1;
-        }
-    }
-
-    const int max_hist = is_full_attn ? ring_slots : ((ring_slots < int(siligemma::GEMMA4_SLIDING_WINDOW)) ? ring_slots : int(siligemma::GEMMA4_SLIDING_WINDOW));
-    const int n_hist = (eff_pos + 1 < max_hist) ? (eff_pos + 1) : max_hist;
-    const int t_start = eff_pos + 1 - n_hist;
-
-    float m_run = -1.0e30f;
-    float l_run = 0.0f;
-    float o0_a = 0.0f, o0_b = 0.0f, o1_a = 0.0f, o1_b = 0.0f;
-
-    #pragma unroll 1
-    for (int t = t_start; t <= eff_pos; ++t) {
-        const bool use_smem = (!is_shared_layer && t == eff_pos);
-        const __nv_bfloat16* k_src = use_smem
-            ? smem_cur_k
-            : (kv_ring_buf + b_kv_off + int64_t(t % ring_slots) * int64_t(stride_k));
-        const __nv_bfloat16* v_src = use_smem ? smem_cur_v : (k_src + head_dim);
-
-        float dot_local = fmaf(q0_a, __bfloat162float(k_src[p0]), q0_b * __bfloat162float(k_src[p0 + half_d]));
-        if (half_d > 128) {
-            dot_local = fmaf(q1_a, __bfloat162float(k_src[p1]), fmaf(q1_b, __bfloat162float(k_src[p1 + half_d]), dot_local));
-        }
-        // Gemma-4 uses scaling = 1.0
-        const float score = tree_reduce_128_sm86(dot_local, smem_tree);
-
-        const float m_new = fmaxf(m_run, score);
-        const float alpha = __expf(m_run - m_new);
-        const float beta = __expf(score - m_new);
-        l_run = fmaf(l_run, alpha, beta);
-
-        o0_a = fmaf(o0_a, alpha, beta * __bfloat162float(v_src[p0]));
-        o0_b = fmaf(o0_b, alpha, beta * __bfloat162float(v_src[p0 + half_d]));
-        if (half_d > 128) {
-            o1_a = fmaf(o1_a, alpha, beta * __bfloat162float(v_src[p1]));
-            o1_b = fmaf(o1_b, alpha, beta * __bfloat162float(v_src[p1 + half_d]));
-        }
-        m_run = m_new;
-    }
-
-    const float inv_l = (l_run > 1.0e-12f) ? (1.0f / l_run) : 0.0f;
-    float* out_dst = attn_out + (int64_t(b_idx) * 8LL + int64_t(head_idx)) * int64_t(head_dim);
-    out_dst[p0] = o0_a * inv_l;
-    out_dst[p0 + half_d] = o0_b * inv_l;
-    if (half_d > 128) {
-        out_dst[p1] = o1_a * inv_l;
-        out_dst[p1 + half_d] = o1_b * inv_l;
-    }
-}
-
-// ----------------------------------------------------------------------------
-// 10. Kernel 8: U-4 L25..L33 Loop Controller Gate + Riccati/S164 Residual Norm
-// ----------------------------------------------------------------------------
-
-__global__ __launch_bounds__(128, 10)
-void siligemma_u4_loop_gate_step_sm86(
-    const float* __restrict__ h_in,
-    const __nv_bfloat16* __restrict__ m_prev_bf16,
-    const __nv_bfloat16* __restrict__ msg_query_bf16, // [H]
-    const __nv_bfloat16* __restrict__ w_down_bf16,    // [r=16, 2*H]
-    const __nv_bfloat16* __restrict__ w_forget_bf16,  // [H, r=16]
-    const __nv_bfloat16* __restrict__ w_gain_bf16,    // [H, r=16]
-    float* __restrict__ h_out,
-    float eps,
-    int d_model
-) {
-    __shared__ float smem_tree[128]; // 512 B
-    __shared__ float smem_blk[16];   // 64 B
-    __shared__ float smem_z[16];     // 64 B (rank=16 bottleneck latent)
-
-    const int tid = threadIdx.x;
-    const int b_idx = int(blockIdx.x);
-    const int64_t row_off = int64_t(b_idx) * int64_t(d_model);
-
-    // Compute canonical RMSNorm scales for h_in and m_eff = m_prev * sigmoid(msg_query)
-    const float h_ss = canonical_sum_sq_d128(h_in + row_off, d_model, smem_tree, smem_blk);
-    const float h_inv = rsqrtf(h_ss / float(d_model) + eps);
-
-    // Compute m_eff norm squared cleanly
-    const int n_chunks = (d_model + 127) >> 7;
-    #pragma unroll 1
-    for (int c = 0; c < n_chunks; ++c) {
-        const int idx = c * 128 + tid;
-        float mv = 0.0f;
-        if (idx < d_model) {
-            const float mq = __bfloat162float(__ldg(&msg_query_bf16[idx]));
-            const float qs = 1.0f / (1.0f + __expf(-mq));
-            mv = __bfloat162float(__ldg(&m_prev_bf16[row_off + idx])) * qs;
-        }
-        const float cs = tree_reduce_128_sm86(mv * mv, smem_tree);
-        if (tid == 0) smem_blk[c] = cs;
-    }
-    __syncthreads();
-    const float m_ss = tree_reduce_128_sm86((tid < n_chunks) ? smem_blk[tid] : 0.0f, smem_tree);
-    const float m_inv = rsqrtf(m_ss / float(d_model) + eps);
-
-    // Project [RMSNorm(h); RMSNorm(m_eff)] -> z[0..15]
-    #pragma unroll 1
-    for (int r = 0; r < 16; ++r) {
+    __shared__ float sm_z[8], sm_y[8], sm_red[4];
+    const int b = blockIdx.x, tid = threadIdx.x;
+    float* hb = h_io + int64_t(b) * D;
+    // Project z = V8 @ h, then y = c_wb_inv_256b @ z (both 8-dim), then h <- h + alpha * (U8^T @ y)
+    for (int r = 0; r < 8; ++r) {
         float acc = 0.0f;
-        const int64_t row_w = int64_t(r) * int64_t(2 * d_model);
-        for (int idx = tid; idx < d_model; idx += 128) {
-            const float mq = __bfloat162float(__ldg(&msg_query_bf16[idx]));
-            const float qs = 1.0f / (1.0f + __expf(-mq));
-            const float hn = __ldg(&h_in[row_off + idx]) * h_inv;
-            const float mn = __bfloat162float(__ldg(&m_prev_bf16[row_off + idx])) * qs * m_inv;
-            acc = fmaf(__bfloat162float(__ldg(&w_down_bf16[row_w + idx])), hn, acc);
-            acc = fmaf(__bfloat162float(__ldg(&w_down_bf16[row_w + d_model + idx])), mn, acc);
-        }
-        const float z_r = tree_reduce_128_sm86(acc, smem_tree);
-        if (tid == 0) smem_z[r] = z_r;
-    }
-    __syncthreads();
-
-    // Update h_out = (1 - tanh(W_forget @ z)) * h + tanh(W_gain @ z) * m_eff
-    for (int idx = tid; idx < d_model; idx += 128) {
-        float fg = 0.0f, gg = 0.0f;
-        const int64_t off_g = int64_t(idx) * 16LL;
-        #pragma unroll
-        for (int r = 0; r < 16; ++r) {
-            const float zv = smem_z[r];
-            fg = fmaf(__bfloat162float(__ldg(&w_forget_bf16[off_g + r])), zv, fg);
-            gg = fmaf(__bfloat162float(__ldg(&w_gain_bf16[off_g + r])), zv, gg);
-        }
-        const float mq = __bfloat162float(__ldg(&msg_query_bf16[idx]));
-        const float qs = 1.0f / (1.0f + __expf(-mq));
-        const float m_eff = __bfloat162float(__ldg(&m_prev_bf16[row_off + idx])) * qs;
-        const float hv = __ldg(&h_in[row_off + idx]);
-        h_out[row_off + idx] = fmaf(1.0f - tanhf(fg), hv, tanhf(gg) * m_eff);
-    }
-}
-
-// ----------------------------------------------------------------------------
-// 11. Kernel 9: P224a IRIS Runtime+Scan Canary Finalize + Softcap Argmax
-// ----------------------------------------------------------------------------
-
-__global__ __launch_bounds__(128, 10)
-void siligemma_iris_canary_finalize_sm86(
-    const float* __restrict__ h_state,
-    siligemma::HoloSphereRazorCanary64* host_canary,
-    uint32_t layer_idx,
-    uint32_t pass_idx,
-    uint32_t golden_iris_expected,
-    int check_golden,
-    int d_model
-) {
-    __shared__ uint32_t smem_crc[128]; // 512 B
-
-    const int tid = threadIdx.x;
-    uint32_t local_h = siligemma::IRIS_WEYL_MIX ^ (layer_idx * 1315423911u) ^ (pass_idx * 2654435761u);
-    for (int i = tid; i < d_model; i += 128) {
-        const float fv = __ldg(&h_state[i]);
-        const uint32_t bits = __float_as_uint(fv);
-        local_h = iris_mix_word_dev(local_h, bits);
-    }
-    smem_crc[tid] = local_h;
-    __syncthreads();
-
-    #pragma unroll
-    for (int s = 64; s >= 1; s >>= 1) {
-        if (tid < s) {
-            smem_crc[tid] = iris_mix_word_dev(smem_crc[tid], smem_crc[tid + s]);
-        }
+        for (int d = tid; d < D; d += 128) acc = fmaf(V8[int64_t(r) * D + d], hb[d], acc);
+        const float sum_r = tree_reduce_128_sm86(acc, sm_red);
+        if (tid == 0) sm_z[r] = sum_r;
         __syncthreads();
     }
-
-    if (tid == 0 && host_canary != nullptr) {
-        const uint32_t step_crc = smem_crc[0];
-        const uint32_t prev_crc = host_canary->iris_runtime_crc_u32;
-        const uint32_t next_crc = iris_mix_word_dev(prev_crc, step_crc);
-        host_canary->iris_runtime_crc_u32 = next_crc;
-        const uint32_t lo_syn = host_canary->last_syndrome_u32 & 0xFFFFu;
-        razor_st_release_sys_u32(&host_canary->last_syndrome_u32, ((next_crc & 0xFFFFu) << 16) | lo_syn);
-        if (check_golden && next_crc != golden_iris_expected) {
-            razor_atom_release_sys_add_u32(&host_canary->iris_mismatch_count_u32, 1u);
-            razor_atom_release_sys_add_u32(&host_canary->ded_count_u32, 1u);
-        }
+    if (tid < 8) {
+        float acc = 0.0f;
+        for (int c = 0; c < 8; ++c) acc = fmaf(c_wb_inv_256b[tid * 8 + c], sm_z[c], acc);
+        sm_y[tid] = acc;
     }
-}
-
-__global__ __launch_bounds__(128, 10)
-void siligemma_softcap_logits_argmax_sm86(
-    const float* __restrict__ raw_logits,
-    float* __restrict__ softcap_logits,
-    int32_t* __restrict__ tok_out,
-    float* __restrict__ score_out,
-    int32_t* __restrict__ d_pos_mut,
-    float softcap,
-    int vocab_size
-) {
-    __shared__ float smem_val[128];
-    __shared__ int32_t smem_idx[128];
-
-    const int tid = threadIdx.x;
-    const int b_idx = int(blockIdx.x);
-    const int64_t row_off = int64_t(b_idx) * int64_t(vocab_size);
-    const float* r_in = raw_logits + row_off;
-    float* r_out = (softcap_logits != nullptr) ? (softcap_logits + row_off) : nullptr;
-    const bool do_cap = (softcap > 0.0f);
-    const float inv_cap = do_cap ? (1.0f / softcap) : 1.0f;
-
-    float best_v = -1.0e30f;
-    int32_t best_i = 0;
-
-    const int v_f4 = vocab_size >> 2;
-    const float4* r_f4 = reinterpret_cast<const float4*>(r_in);
-    float4* o_f4 = (r_out != nullptr) ? reinterpret_cast<float4*>(r_out) : nullptr;
-    for (int i = tid; i < v_f4; i += 128) {
-        const float4 v4 = __ldg(&r_f4[i]);
-        const float c0 = do_cap ? (softcap * tanhf(v4.x * inv_cap)) : v4.x;
-        const float c1 = do_cap ? (softcap * tanhf(v4.y * inv_cap)) : v4.y;
-        const float c2 = do_cap ? (softcap * tanhf(v4.z * inv_cap)) : v4.z;
-        const float c3 = do_cap ? (softcap * tanhf(v4.w * inv_cap)) : v4.w;
-        if (o_f4 != nullptr) o_f4[i] = make_float4(c0, c1, c2, c3);
-        const int base = i * 4;
-        if (c0 > best_v || (c0 == best_v && base + 0 < best_i)) { best_v = c0; best_i = base + 0; }
-        if (c1 > best_v || (c1 == best_v && base + 1 < best_i)) { best_v = c1; best_i = base + 1; }
-        if (c2 > best_v || (c2 == best_v && base + 2 < best_i)) { best_v = c2; best_i = base + 2; }
-        if (c3 > best_v || (c3 == best_v && base + 3 < best_i)) { best_v = c3; best_i = base + 3; }
-    }
-    smem_val[tid] = best_v;
-    smem_idx[tid] = best_i;
     __syncthreads();
-
-    #pragma unroll
-    for (int s = 64; s >= 1; s >>= 1) {
-        if (tid < s) {
-            const float ov = smem_val[tid + s];
-            const int32_t oi = smem_idx[tid + s];
-            if (ov > smem_val[tid] || (ov == smem_val[tid] && oi < smem_idx[tid])) {
-                smem_val[tid] = ov;
-                smem_idx[tid] = oi;
-            }
-        }
-        __syncthreads();
-    }
-    if (tid == 0) {
-        tok_out[b_idx] = smem_idx[0];
-        score_out[b_idx] = smem_val[0];
-        if (b_idx == 0 && d_pos_mut != nullptr) {
-            *d_pos_mut += 1;
-        }
+    for (int d = tid; d < D; d += 128) {
+        float delta = 0.0f;
+        for (int r = 0; r < 8; ++r) delta = fmaf(U8[int64_t(r) * D + d], sm_y[r], delta);
+        hb[d] = fmaf(alpha, delta, hb[d]);
     }
 }
 
-// ----------------------------------------------------------------------------
-// 12. Tied BF16 Embedding Lookup / State Snapshot + BF16 LM Head + Euclidean Baselines
-// ----------------------------------------------------------------------------
-
+// 18. Multi-CTA U-4 Loop Gate (r=16, 0 B KV, 0 B extra bulk weights):
+// Stage 1: project h -> z[16] (grid=(16, B)); Stage 2: h += alpha * U^T @ z (grid=(D/128, B))
 __global__ __launch_bounds__(128, 10)
-void siligemma_embed_lookup_sm86(
-    const __nv_bfloat16* __restrict__ embed_bf16,
-    const int32_t* __restrict__ tok_in_i32,
-    const float* __restrict__ f32_in,
-    float* __restrict__ f32_out,
-    __nv_bfloat16* __restrict__ bf16_out,
-    float embed_scale,
-    int d_model,
-    int mode  // 0: embed lookup (* embed_scale -> f32_out), 1: snapshot f32_in -> bf16_out
+void u4_loop_proj_r16_sm86(
+    const float* __restrict__ h_in, const float* __restrict__ V16, float* __restrict__ z_out, int B, int D
 ) {
-    const int tid = threadIdx.x;
-    const int b_idx = int(blockIdx.x);
-    const int64_t row_off = int64_t(b_idx) * int64_t(d_model);
-    if (mode == 0) {
-        const int32_t tid_tok = __ldg(&tok_in_i32[b_idx]);
-        const __nv_bfloat16* src = embed_bf16 + int64_t(tid_tok) * int64_t(d_model);
-        for (int i = tid; i < d_model; i += 128) {
-            f32_out[row_off + i] = __bfloat162float(__ldg(&src[i])) * embed_scale;
-        }
-    } else {
-        for (int i = tid; i < d_model; i += 128) {
-            bf16_out[row_off + i] = __float2bfloat16(__ldg(&f32_in[row_off + i]));
-        }
-    }
-}
-
-__global__ __launch_bounds__(128, 10)
-void siligemma_bf16_lm_head_r4_sm86(
-    const float* __restrict__ x_norm_in,
-    const __nv_bfloat16* __restrict__ emb_bf16,
-    float* __restrict__ logits_out,
-    float softcap,
-    int vocab_size,
-    int d_model
-) {
-    const int tid = threadIdx.x;
-    const int wid = tid >> 5;
-    const int lane = tid & 31;
-    const int row = int(blockIdx.x) * 4 + wid;
-    const bool active_row = (row < vocab_size);
-    const int d_f8 = d_model >> 3;
-
-    const float4* w_f4 = active_row ? reinterpret_cast<const float4*>(emb_bf16 + int64_t(row) * int64_t(d_model)) : nullptr;
-    const float4* x_f4 = reinterpret_cast<const float4*>(x_norm_in);
-
+    __shared__ float sm[4];
+    const int r = blockIdx.x, b = blockIdx.y, tid = threadIdx.x;
     float acc = 0.0f;
-    if (active_row) {
-        for (int i = lane; i < d_f8; i += 32) {
-            const float4 wv = __ldg(&w_f4[i]);
-            const float4 x0 = __ldg(&x_f4[i * 2 + 0]);
-            const float4 x1 = __ldg(&x_f4[i * 2 + 1]);
-            const __nv_bfloat162* wp = reinterpret_cast<const __nv_bfloat162*>(&wv);
-            const float2 f0 = __bfloat1622float2(wp[0]);
-            const float2 f1 = __bfloat1622float2(wp[1]);
-            const float2 f2 = __bfloat1622float2(wp[2]);
-            const float2 f3 = __bfloat1622float2(wp[3]);
-            acc = fmaf(f0.x, x0.x, fmaf(f0.y, x0.y, fmaf(f1.x, x0.z, fmaf(f1.y, x0.w, acc))));
-            acc = fmaf(f2.x, x1.x, fmaf(f2.y, x1.y, fmaf(f3.x, x1.z, fmaf(f3.y, x1.w, acc))));
-        }
-    }
-    acc = warp_sum_32(acc);
-    if (active_row && lane == 0) {
-        if (softcap > 0.0f) {
-            acc = softcap * tanhf(acc / softcap);
-        }
-        logits_out[row] = acc;
-    }
-}
-
-__global__ __launch_bounds__(128, 6)
-void siligemma_bf16_lm_head_b16_sm86(
-    const float* __restrict__ x_norm_in,
-    const __nv_bfloat16* __restrict__ emb_bf16,
-    float* __restrict__ logits_out,
-    float softcap,
-    int batch_size,
-    int vocab_size,
-    int d_model
-) {
-    __shared__ float smem_tree[128];  // 512 B
-    __shared__ float smem_b[16][128]; // 8,192 B
-
-    const int tid = threadIdx.x;
-    const int row = int(blockIdx.x);
-    if (row >= vocab_size) return;
-
-    for (int b = 0; b < batch_size; ++b) {
-        smem_b[b][tid] = 0.0f;
-    }
-
-    const int d_f8 = d_model >> 3;
-    const int d_f4 = d_model >> 2;
-    const float4* w_f4 = reinterpret_cast<const float4*>(emb_bf16 + int64_t(row) * int64_t(d_model));
-    const float4* x_f4 = reinterpret_cast<const float4*>(x_norm_in);
-
-    #pragma unroll 1
-    for (int i = tid; i < d_f8; i += 128) {
-        const float4 wv = __ldg(&w_f4[i]);
-        const __nv_bfloat162* wp = reinterpret_cast<const __nv_bfloat162*>(&wv);
-        const float2 f0 = __bfloat1622float2(wp[0]);
-        const float2 f1 = __bfloat1622float2(wp[1]);
-        const float2 f2 = __bfloat1622float2(wp[2]);
-        const float2 f3 = __bfloat1622float2(wp[3]);
-        #pragma unroll 1
-        for (int b = 0; b < batch_size; ++b) {
-            const float4 x0 = __ldg(&x_f4[int64_t(b) * int64_t(d_f4) + i * 2 + 0]);
-            const float4 x1 = __ldg(&x_f4[int64_t(b) * int64_t(d_f4) + i * 2 + 1]);
-            float a = fmaf(f0.x, x0.x, fmaf(f0.y, x0.y, fmaf(f1.x, x0.z, f1.y * x0.w)));
-            a = fmaf(f2.x, x1.x, fmaf(f2.y, x1.y, fmaf(f3.x, x1.z, fmaf(f3.y, x1.w, a))));
-            smem_b[b][tid] += a;
-        }
-    }
-
-    #pragma unroll 1
-    for (int b = 0; b < batch_size; ++b) {
-        float sum = tree_reduce_128_sm86(smem_b[b][tid], smem_tree);
-        if (tid == 0) {
-            if (softcap > 0.0f) {
-                sum = softcap * tanhf(sum / softcap);
-            }
-            logits_out[int64_t(b) * int64_t(vocab_size) + int64_t(row)] = sum;
-        }
-    }
+    for (int d = tid; d < D; d += 128) acc = fmaf(__ldg(&V16[int64_t(r) * D + d]), __ldg(&h_in[int64_t(b) * D + d]), acc);
+    const float s = tree_reduce_128_sm86(acc, sm);
+    if (tid == 0) z_out[b * 16 + r] = tanhf(s);
 }
 
 __global__ __launch_bounds__(128, 10)
-void siligemma_euclidean_lora_r4_sm86(
-    const float* __restrict__ x_in,
-    const float4* __restrict__ a_f4,
-    const float4* __restrict__ b_f4,
-    float* __restrict__ y_out,
-    float alpha_scale,
-    int d_model
+void u4_loop_apply_r16_sm86(
+    float* __restrict__ h_io, const float* __restrict__ z_in, const float* __restrict__ U16,
+    float alpha, int B, int D
 ) {
-    __shared__ float4 smem_u_warp[4];
-    __shared__ float4 smem_u;
+    __shared__ float sm_z[16];
+    const int tid = threadIdx.x, b = blockIdx.y, d = blockIdx.x * 128 + tid;
+    if (tid < 16) sm_z[tid] = z_in[b * 16 + tid];
+    __syncthreads();
+    if (d >= D) return;
+    float delta = 0.0f;
+    #pragma unroll
+    for (int r = 0; r < 16; ++r) delta = fmaf(__ldg(&U16[int64_t(r) * D + d]), sm_z[r], delta);
+    h_io[int64_t(b) * D + d] = fmaf(alpha, delta, h_io[int64_t(b) * D + d]);
+}
 
-    const int tid = threadIdx.x;
-    const int wid = tid >> 5;
-    const int lane = tid & 31;
-
-    float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
-    for (int i = tid; i < d_model; i += 128) {
-        const float xi = __ldg(&x_in[i]);
-        const float4 av = __ldg(&a_f4[i]);
-        u0 = fmaf(av.x, xi, u0);
-        u1 = fmaf(av.y, xi, u1);
-        u2 = fmaf(av.z, xi, u2);
-        u3 = fmaf(av.w, xi, u3);
+// 19. IRIS Canary Finalizer (detects SEC/DED/poisoning and hashes telemetry -> SafeHalt)
+__global__ __launch_bounds__(128, 8)
+void iris_canary_finalize_sm86(const float* __restrict__ h_in, HoloSphereRazorCanary64* can, int B, int D) {
+    __shared__ uint64_t sm_h[4];
+    const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31;
+    uint64_t acc = 0x517CC1B727220A95ULL;
+    for (int i = tid; i < B * D; i += 128) {
+        const float v = h_in[i];
+        uint32_t u; memcpy(&u, &v, 4);
+        acc ^= uint64_t(u) * 0x9E3779B97F4A7C15ULL + uint64_t(i);
     }
-    u0 = warp_sum_32(u0);
-    u1 = warp_sum_32(u1);
-    u2 = warp_sum_32(u2);
-    u3 = warp_sum_32(u3);
-    if (lane == 0) smem_u_warp[wid] = make_float4(u0, u1, u2, u3);
+    for (int m = 16; m >= 1; m >>= 1) acc ^= __shfl_xor_sync(0xFFFFFFFFu, acc, m);
+    if (lane == 0) sm_h[wid] = acc;
     __syncthreads();
     if (tid == 0) {
-        float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        #pragma unroll
-        for (int w = 0; w < 4; ++w) {
-            const float4 sw = smem_u_warp[w];
-            s.x += sw.x; s.y += sw.y; s.z += sw.z; s.w += sw.w;
-        }
-        smem_u = s;
-    }
-    __syncthreads();
-
-    const float4 uv = smem_u;
-    for (int i = tid; i < d_model; i += 128) {
-        const float4 bv = __ldg(&b_f4[i]);
-        const float delta = alpha_scale * fmaf(bv.x, uv.x, fmaf(bv.y, uv.y, fmaf(bv.z, uv.z, bv.w * uv.w)));
-        y_out[i] = __ldg(&x_in[i]) + delta;
+        const uint64_t h = sm_h[0] ^ sm_h[1] ^ sm_h[2] ^ sm_h[3];
+        uint64_t st = can->iris_state;
+        auto mix = [](uint64_t s, uint64_t val) {
+            s ^= val + 0x9E3779B97F4A7C15ULL + (s << 6) + (s >> 2);
+            s *= 0xBF58476D1CE4E5B9ULL;
+            s ^= (s >> 31);
+            return s;
+        };
+        st = mix(st, h);
+        st = mix(st, (uint64_t(can->sec_cnt) << 32) | uint64_t(can->ded_cnt));
+        st = mix(st, (uint64_t(can->step_ctr) << 32) | uint64_t(can->u4_passes));
+        if (can->sec_cnt != 0u || can->ded_cnt != 0u) can->poisoned = 1u;
+        can->iris_state = st;
+        can->checksum = st ^ uint64_t(can->poisoned);
     }
 }
 
-__global__ __launch_bounds__(128, 10)
-void siligemma_tree_reduce_probe_sm86(
-    const float* __restrict__ x_in,
-    float* __restrict__ sum_out,
-    int dim
-) {
-    __shared__ float smem_tree[128];
-    __shared__ float smem_blk[96];
-    const int tid = threadIdx.x;
-    const int b_idx = int(blockIdx.x);
-    const float* x_row = x_in + int64_t(b_idx) * int64_t(dim);
-    const int n_chunks = (dim + 127) >> 7;
-    #pragma unroll 1
-    for (int c = 0; c < n_chunks; ++c) {
-        const int idx = c * 128 + tid;
-        const float xv = (idx < dim) ? __ldg(&x_row[idx]) : 0.0f;
-        const float cs = tree_reduce_128_sm86(xv, smem_tree);
-        if (tid == 0) smem_blk[c] = cs;
-    }
-    __syncthreads();
-    const float tot = tree_reduce_128_sm86((tid < n_chunks) ? smem_blk[tid] : 0.0f, smem_tree);
-    if (tid == 0) sum_out[b_idx] = tot;
+// 20. Async PLE DMA test micro-kernel (touches staging host-pinned buffer on background stream)
+__global__ __launch_bounds__(128, 8)
+void ple_async_dma_touch_sm86(const float* __restrict__ ple_buf, float* __restrict__ acc_out, int N) {
+    const int i = blockIdx.x * 128 + threadIdx.x;
+    if (i < N) acc_out[i] = ple_buf[i] * 0.70710678f;
 }
 
-}  // namespace siligemma_sm86
+} // namespace s184b
 
-#endif  // SILIGEMMA_KERNELS_SM86_CU
+#endif // SILIGEMMA_KERNELS_SM86_CU

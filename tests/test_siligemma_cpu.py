@@ -42,13 +42,17 @@ import pack_siligemma_formb as packer  # noqa: E402
 
 EXPECTED_PINNED_SHA256 = {
     "Makefile": "7cb15397c024c1f0cc47efb6a9b67fad17b6a276023e5631e1366cb56e7271df",
+    "docs/ARCHITECTURE_FORMB_S2.md": "2c0be6c7cbddadd7990c0db09230e59dabff0385aa8a5cec39e7b617966721e1",
     "docs/ARCHITECTURE_FORMB_SILIGEMMA.md": "b7410d0c491748632585f884115d8241efe0b837290ce164e78fe41a0b074fd6",
     "docs/PREREG_W22_GEMMA4_FORMB.json": "03724afa55d9008675225ae48cf78bc2fdcd180418ec6a5ad60a4e15facf37e0",
+    "docs/PREREG_W22_GEMMA4_FORMB_S2.json": "dd24290eeed3bc5e5b9a145b3c6842ea715a069d46ef4d139c92c68d6ffbb867",
     "docs/STAGE1_REPORT.md": "86f95ebae659922693853c030723d120996dd8d56de82cb875c922076023af99",
     "docs/STAGE1_VERDICT.json": "d67403ae29265313d163e93ea0184ef5eb9c17e4a5786c89bff186540df4c97b",
-    "kernels/siligemma_arena.hpp": "dd44365c2f43577c10df625cb958fb386567507d787f01d26f79533b9849fb23",
-    "kernels/siligemma_bench_sm86.cu": "bbc026e88570066ab8695362ec1bae02a9ea6e7a959ec8c38eb5b1ab0852113e",
-    "kernels/siligemma_kernels_sm86.cu": "5ee2e547bcacc0b14659160645c0044b32accf10e0c4326db97f55d440413818",
+    "docs/STAGE2_REPORT.md": "cd62bf80b779250d81a4ddc7023489a29bc73ab5d2bb6997f0774fac3d4f60d1",
+    "docs/STAGE2_VERDICT.json": "69fc6ccf412b79dcfbe7019a9ec2b66d3190bd10dbbe50aea8e3eee90588f8e2",
+    "kernels/siligemma_arena.hpp": "812c0cf4a0fdd1875dc4d6f013dd4316148f13a4c743e5346b5392c52c368dda",
+    "kernels/siligemma_bench_sm86.cu": "ff0773219be6ced4847877aef10eda6c5a3a45b6737291626993823d86b619e7",
+    "kernels/siligemma_kernels_sm86.cu": "88e3ab30be9c041bc98247f9eb670de8fe6f402f9b7e80711d7fa017fa17a4c8",
     "tools/pack_siligemma_formb.py": "689ed377f7bd32061c0bf01561bae2a665c2b2320b282e77a87e540f75a97faf",
     "tools/slgb_cpu_worker.cpp": "da51f06391612947efeebf66fa3b2224ff6f02701829fd14ca3ed7bed42e6516",
 }
@@ -419,6 +423,7 @@ int main() {{
 
     const float vec[1536] = {{ {vec_lit} }};
     const float gam[1536] = {{ {gam_lit} }};
+    const float tree_reduce_first128 = s184b::canonical_tree_reduce_128_cpu(vec);
     const float tree_sum = siligemma::canonical_tree_sum_block128_f32(vec, 1536u);
     std::vector<float> big20k(20000u, 0.0f);
     for (size_t i = 0u; i < 20000u; ++i) big20k[i] = vec[i % 1536u] * 0.25f;
@@ -450,6 +455,30 @@ int main() {{
     tiny_neg[0] = -1.0e-13f;
     if (siligemma::evaluate_riccati_loop_guard(tiny_pos.data(), tiny_neg.data(), zero_d.data(), D, 3u, rho_z, sr_z, cos_z) != siligemma::ValidationError::ERR_S164_STEP_DIVERGENCE ||
         cos_z >= -0.99f) return 31;
+
+    // Stage-2 namespace s184b parity controls
+    if (s184b::LIVE_LINEAR_COUNT != 276 || s184b::DEAD_KV_TENSORS_OMITTED != 60 ||
+        s184b::kArena16K != siligemma::kArena16K.total_arena_bytes ||
+        s184b::kArena64KShadow != siligemma::kArena64KShadow.total_arena_bytes ||
+        s184b::kArena128K != siligemma::kArena128K.total_arena_bytes ||
+        s184b::WIRE_BYTES_G32_45BPW != 1055711232ULL) return 34;
+    const uint64_t s2_cw = s184b::encode_secded_w64_cpu(0x0F1E2D3C4B5A6978ULL);
+    if (s184b::secded_syn_cpu(s2_cw) != 0u) return 35;
+    if (s184b::canonical_tree_reduce_128_cpu(vec) != tree_reduce_first128) return 36;
+    float s2_M[64], s2_Minv[64];
+    for (int r = 0; r < 8; ++r)
+        for (int c = 0; c < 8; ++c)
+            s2_M[r * 8 + c] = (r == c ? 1.0f : 0.0f) + 0.05f * std::sin(float(r * 5 + c * 3 + 1));
+    if (!s184b::invert_8x8_cpu(s2_M, s2_Minv)) return 37;
+    double wb_id_err = 0.0;
+    for (int r = 0; r < 8; ++r) {{
+        for (int c = 0; c < 8; ++c) {{
+            double acc = 0.0;
+            for (int k = 0; k < 8; ++k) acc += double(s2_M[r * 8 + k]) * double(s2_Minv[k * 8 + c]);
+            wb_id_err = std::max(wb_id_err, std::fabs(acc - (r == c ? 1.0 : 0.0)));
+        }}
+    }}
+    if (wb_id_err > 1e-6) return 38;
 
     std::printf(
         "{{\\"tree_sum_bits\\": \\"0x%08x\\", \\"sum_20k_bits\\": \\"0x%08x\\", \\"rms0_bits\\": \\"0x%08x\\", \\"rms1535_bits\\": \\"0x%08x\\", "
@@ -598,6 +627,32 @@ class TestSiliGemmaCPU(unittest.TestCase):
             self.assertEqual(recomp[g_name], verdict["kill_gates"][g_name]["disposition"])
         self.assertEqual(recomp["overall_disposition"], verdict["kill_gates"]["overall_disposition"])
 
+        s2_arch_sha = hashlib.sha256(read_regular_bytes_nofollow(DOCS_DIR / "ARCHITECTURE_FORMB_S2.md")).hexdigest()
+        s2_prereg = parse_strict_json_bytes(read_regular_bytes_nofollow(DOCS_DIR / "PREREG_W22_GEMMA4_FORMB_S2.json"), label="s2_prereg")
+        s2_verdict = parse_strict_json_bytes(read_regular_bytes_nofollow(DOCS_DIR / "STAGE2_VERDICT.json"), label="s2_verdict")
+        s2_prereg_sha = hashlib.sha256(read_regular_bytes_nofollow(DOCS_DIR / "PREREG_W22_GEMMA4_FORMB_S2.json")).hexdigest()
+        self.assertEqual(s2_prereg["architecture_sha256"], s2_arch_sha)
+        self.assertEqual(s2_verdict["arch_sha256"], s2_arch_sha)
+        self.assertEqual(s2_verdict["prereg_sha256"], s2_prereg_sha)
+        s2_p = s2_verdict["parity_kg_gfb1"]
+        s2_s = s2_verdict["silicon_hygiene_kg_gfb2"]["bench_metrics"]
+        s2_t = s2_verdict["throughput_kg_gfb3"]
+        s2_u = s2_verdict["u4_loop_and_h1_synergy_kg_gfb4"]
+        self.assertLessEqual(float(s2_p["b1_dp4a22_45bpw_vs_hf_fp32"]["max_logit_err"]), 1.0e-3)
+        self.assertGreaterEqual(float(s2_p["b16_mma_45bpw_vs_hf_fp32"]["cos"]), 0.99999)
+        self.assertEqual(s2_verdict["kill_gates"]["KG-GFB1"], "PASS")
+        self.assertEqual(s2_verdict["silicon_hygiene_kg_gfb2"]["sass_ldl_stl"], 0)
+        self.assertLessEqual(float(s2_s["arena_128k_vram_mib"]), 3072.0)
+        self.assertEqual(s2_verdict["kill_gates"]["KG-GFB2"], "PASS")
+        self.assertLess(float(s2_t["b1_k1_g32_toks"]), float(s2_prereg["kill_gates"]["KG-GFB3"]["b1_k1_g32_toks_min"]))
+        self.assertGreaterEqual(float(s2_t["b16_k1_g32_toks"]), float(s2_prereg["kill_gates"]["KG-GFB3"]["b16_k1_g32_toks_min"]))
+        self.assertEqual(s2_verdict["kill_gates"]["KG-GFB3"], "FAIL")
+        self.assertEqual(int(s2_u["extra_kv_bytes"]), 0)
+        self.assertEqual(int(s2_u["extra_bulk_weight_bytes"]), 0)
+        self.assertLess(float(s2_u["h1_forma_synergy"]["cal_meta"]["rho_hat"]), 0.61803398875)
+        self.assertEqual(s2_verdict["kill_gates"]["KG-GFB4"], "PASS")
+        self.assertEqual(s2_verdict["overall_verdict"], "FAIL_GATE")
+
         self.assertEqual(a16_secded_syndrome_py(0), 0)
         syn1 = a16_secded_syndrome_py(1 << 20)
         self.assertTrue(syn1 != 0 and (syn1 & 1) == 1 and ((syn1 >> 1) & 15) == 5)
@@ -688,17 +743,17 @@ class TestSiliGemmaCPU(unittest.TestCase):
             f"ptxas info    : Function properties for k{i}\n"
             "    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads\n"
             f"ptxas info    : Used {48 if i == 0 else 32} registers, used 1 barriers, 1664 bytes smem"
-            for i in range(20)
+            for i in range(33)
         )
         parsed = parse_ptxas_log(sample_ptxas)
-        ok = validate_ptxas_and_sass(parsed, {"ldl_insns": 0, "stl_insns": 0}, min_kernels=13)
-        self.assertEqual(ok["total_kernels"], 20)
+        ok = validate_ptxas_and_sass(parsed, {"ldl_insns": 0, "stl_insns": 0}, min_kernels=33)
+        self.assertEqual(ok["total_kernels"], 33)
         self.assertEqual(ok["max_registers"], 48)
         bad_reg = parse_ptxas_log(sample_ptxas.replace("Used 48 registers", "Used 49 registers"))
         with self.assertRaises(SiliGemmaGateError):
-            validate_ptxas_and_sass(bad_reg, {"ldl_insns": 0, "stl_insns": 0}, min_kernels=13)
+            validate_ptxas_and_sass(bad_reg, {"ldl_insns": 0, "stl_insns": 0}, min_kernels=33)
         with self.assertRaises(SiliGemmaGateError):
-            validate_ptxas_and_sass(parsed, {"ldl_insns": 1, "stl_insns": 0}, min_kernels=13)
+            validate_ptxas_and_sass(parsed, {"ldl_insns": 1, "stl_insns": 0}, min_kernels=33)
 
 
 def main() -> int:
