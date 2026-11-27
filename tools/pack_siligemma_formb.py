@@ -363,21 +363,30 @@ def validate_safetensors_tensor_spans(hdr: dict[str, Any], geom: dict[str, Any],
         prev_key = key
 
 
-def _verify_worker_outputs(pack_stdout: str, verify_stdout: str) -> None:
-    m1 = re.search(r"\bPACK_COMPLETE\s+linears=(\d+)\s+embeds=(\d+)\s+norms=(\d+)\b", pack_stdout)
-    if not m1:
-        raise RuntimeError(f"Worker --pack output missing summary counts: {pack_stdout!r}")
+def _verify_worker_outputs(pack_stdout: str | None, verify_stdout: str) -> None:
     geom = build_gemma4_descriptor_geometry(32)
-    exp_linears = LIVE_LINEAR_COUNT
-    exp_norms = len(geom["norm_specs"])
-    if (int(m1.group(1)), int(m1.group(2)), int(m1.group(3))) != (exp_linears, 1, exp_norms):
-        raise RuntimeError(f"Worker --pack incomplete job counts: {m1.group(0)!r}")
+    if pack_stdout is not None:
+        m1 = re.search(r"\bPACK_COMPLETE\s+linears=(\d+)\s+embeds=(\d+)\s+norms=(\d+)\b", pack_stdout)
+        if not m1:
+            raise RuntimeError(f"Worker --pack output missing summary counts: {pack_stdout!r}")
+        exp_linears = LIVE_LINEAR_COUNT
+        exp_norms = len(geom["norm_specs"])
+        if (int(m1.group(1)), int(m1.group(2)), int(m1.group(3))) != (exp_linears, 1, exp_norms):
+            raise RuntimeError(f"Worker --pack incomplete job counts: {m1.group(0)!r}")
     exp_words = (sum(int(d["out_dim"]) * int(d["in_dim"]) for d in geom["linears"]) + GEMMA4_VOCAB * GEMMA4_HIDDEN) // 16
-    m2 = re.search(r"\bSLGB_VERIFY_PASS\s+total_words=(\d+)\s+secded_errors=0\b", verify_stdout)
+    exp_scales = (sum(int(d["out_dim"]) * (int(d["in_dim"]) // 32) for d in geom["linears"]) + GEMMA4_VOCAB * (GEMMA4_HIDDEN // 32))
+    m2 = re.search(
+        r"\bSLGB_VERIFY_PASS\s+flags=(\d+)\s+total_words=(\d+)\s+total_scales=(\d+)\s+secded_errors=0\b",
+        verify_stdout,
+    )
     if not m2:
-        raise RuntimeError(f"Worker --verify output missing SLGB_VERIFY_PASS: {verify_stdout!r}")
-    if int(m2.group(1)) != exp_words:
-        raise RuntimeError(f"Worker --verify word count mismatch: {m2.group(1)} != {exp_words}")
+        raise RuntimeError(f"Worker --verify output missing SLGB_VERIFY_PASS summary: {verify_stdout!r}")
+    if int(m2.group(1)) != 3:
+        raise RuntimeError(f"Worker --verify unexpected header flags={m2.group(1)} != 3")
+    if int(m2.group(2)) != exp_words:
+        raise RuntimeError(f"Worker --verify word count mismatch: {m2.group(2)} != {exp_words}")
+    if int(m2.group(3)) != exp_scales:
+        raise RuntimeError(f"Worker --verify scale count mismatch: {m2.group(3)} != {exp_scales}")
 
 
 def pack_safetensors_to_slgb(st_path: Path, slgb_out: Path) -> dict[str, Any]:
@@ -473,6 +482,7 @@ def verify_slgb_file(slgb_path: Path) -> dict[str, Any]:
         proc = subprocess.run([str(worker), "--verify", str(slgb_path)], capture_output=True, text=True, check=False)
         if proc.returncode != 0:
             raise RuntimeError(f"Verify failed:\n{proc.stderr}\n{proc.stdout}")
+    _verify_worker_outputs(None, proc.stdout)
     return {"status": "VERIFY_PASS", "slgb_bytes": slgb_path.stat().st_size, "output": proc.stdout.strip()}
 
 

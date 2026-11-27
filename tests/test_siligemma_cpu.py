@@ -46,11 +46,11 @@ EXPECTED_PINNED_SHA256 = {
     "docs/PREREG_W22_GEMMA4_FORMB.json": "03724afa55d9008675225ae48cf78bc2fdcd180418ec6a5ad60a4e15facf37e0",
     "docs/STAGE1_REPORT.md": "86f95ebae659922693853c030723d120996dd8d56de82cb875c922076023af99",
     "docs/STAGE1_VERDICT.json": "d67403ae29265313d163e93ea0184ef5eb9c17e4a5786c89bff186540df4c97b",
-    "kernels/siligemma_arena.hpp": "aaa8ba09951139d8b2acbc74af2281f9c6d7d1615f9d324462b700bbc515010f",
-    "kernels/siligemma_bench_sm86.cu": "98bbea50e6c0a4c294a57458e171104c8cddbd91f229d6c0f6a4eaadd0468369",
+    "kernels/siligemma_arena.hpp": "357f2b94f88510d5389769a6eded1b135070a2137a48b9dfd84c962a69ba8249",
+    "kernels/siligemma_bench_sm86.cu": "035fed719316a12cc5f2212ad525ed2ca1ce02f82a7bf5abe43836066bf14c09",
     "kernels/siligemma_kernels_sm86.cu": "5ee2e547bcacc0b14659160645c0044b32accf10e0c4326db97f55d440413818",
-    "tools/pack_siligemma_formb.py": "72c4056492ba0b99080978d14d31aeb9294647bb7bf4803a082ba5d91319fd3a",
-    "tools/slgb_cpu_worker.cpp": "7dc6a96f6d74e4301e19ac64fb7847f83fb99c98d96585772ed32583c8c77284",
+    "tools/pack_siligemma_formb.py": "26f8be7875cd7612addfc89cdfd3d06efb32fed2b7cd03a18749703bca968be3",
+    "tools/slgb_cpu_worker.cpp": "1f9220b2470934dfe58acc498a998b7823442a5bb4e6fabe72ea32dbcbae2ccb",
 }
 
 MAX_KERNEL_REGS = 48
@@ -387,6 +387,12 @@ int main() {{
         auto bad_noff = layers32;
         bad_noff[0].norm_offsets_f32[0] = 285000;
         if (siligemma::validate_runtime_contract(hdr32, bad_noff, lin32, ok_toks, 3u) != siligemma::ValidationError::ERR_BAD_DIMS) return 26;
+        auto ov_noff = layers32;
+        ov_noff[1].norm_offsets_f32[0] = ov_noff[0].norm_offsets_f32[0];
+        if (siligemma::validate_runtime_contract(hdr32, ov_noff, lin32, ok_toks, 3u) != siligemma::ValidationError::ERR_BAD_DIMS) return 29;
+        auto ov_wire = lin32;
+        ov_wire[1].words_byte_offset = ov_wire[0].words_byte_offset;
+        if (siligemma::validate_runtime_contract(hdr32, layers32, ov_wire, ok_toks, 3u) != siligemma::ValidationError::ERR_BAD_WIRE_BYTES) return 30;
         auto zero_rt_hdr = hdr32;
         zero_rt_hdr.header_crc32 = 0u;
         if (siligemma::validate_runtime_contract(zero_rt_hdr, layers32, lin32, ok_toks, 3u, true) != siligemma::ValidationError::ERR_BAD_CRC32) return 27;
@@ -434,6 +440,11 @@ int main() {{
     float sr_z = 1.0f, cos_z = 0.0f;
     if (siligemma::evaluate_riccati_loop_guard(zero_d.data(), zero_d.data(), zero_d.data(), D, 3u, rho_z, sr_z, cos_z) != siligemma::ValidationError::OK ||
         rho_z != 0.0 || cos_z != 1.0f) return 28;
+    std::vector<float> tiny_pos(D, 0.0f), tiny_neg(D, 0.0f);
+    tiny_pos[0] = 1.0e-13f;
+    tiny_neg[0] = -1.0e-13f;
+    if (siligemma::evaluate_riccati_loop_guard(tiny_pos.data(), tiny_neg.data(), zero_d.data(), D, 3u, rho_z, sr_z, cos_z) != siligemma::ValidationError::ERR_S164_STEP_DIVERGENCE ||
+        cos_z >= -0.99f) return 31;
 
     std::printf(
         "{{\\"tree_sum_bits\\": \\"0x%08x\\", \\"sum_20k_bits\\": \\"0x%08x\\", \\"rms0_bits\\": \\"0x%08x\\", \\"rms1535_bits\\": \\"0x%08x\\", "
@@ -587,17 +598,22 @@ class TestSiliGemmaCPU(unittest.TestCase):
 
         packer._verify_worker_outputs(
             "PACK_COMPLETE linears=276 embeds=1 norms=262\n",
-            "SLGB_VERIFY_PASS total_words=142467072 secded_errors=0\n",
+            "SLGB_VERIFY_PASS flags=3 total_words=142467072 total_scales=71233536 secded_errors=0\n",
         )
         with self.assertRaises(RuntimeError):
             packer._verify_worker_outputs(
                 "PACK_COMPLETE linears=275 embeds=1 norms=262\n",
-                "SLGB_VERIFY_PASS total_words=142467072 secded_errors=0\n",
+                "SLGB_VERIFY_PASS flags=3 total_words=142467072 total_scales=71233536 secded_errors=0\n",
             )
         with self.assertRaises(RuntimeError):
             packer._verify_worker_outputs(
                 "PACK_COMPLETE linears=276 embeds=1 norms=262\n",
-                "SLGB_VERIFY_PASS total_words=12345 secded_errors=0\n",
+                "SLGB_VERIFY_PASS flags=1 total_words=142467072 total_scales=71233536 secded_errors=0\n",
+            )
+        with self.assertRaises(RuntimeError):
+            packer._verify_worker_outputs(
+                "PACK_COMPLETE linears=276 embeds=1 norms=262\n",
+                "SLGB_VERIFY_PASS flags=3 total_words=142467072 total_scales=123 secded_errors=0\n",
             )
 
     def test_04_slgb_cpu_worker_quantize_and_tamper_controls(self) -> None:
@@ -646,6 +662,13 @@ class TestSiliGemmaCPU(unittest.TestCase):
             self.assertNotEqual(q_bad_arg.returncode, 0)
             q_bad_sz = subprocess.run([str(worker), "--selftest-quant", str(in_p), "32", str(k), str(w_p), str(s_p)], capture_output=True, text=True, check=False)
             self.assertNotEqual(q_bad_sz.returncode, 0)
+
+            nan_p = td_p / "nan.bf16"
+            nan_vals = list(bf16_u16)
+            nan_vals[17] = 0x7FC0
+            nan_p.write_bytes(struct.pack(f"<{m * k}H", *nan_vals))
+            q_nan = subprocess.run([str(worker), "--selftest-quant", str(nan_p), str(m), str(k), str(w_p), str(s_p)], capture_output=True, text=True, check=False)
+            self.assertNotEqual(q_nan.returncode, 0)
 
     def test_05_r5_ptxas_and_sass_must_fail_controls(self) -> None:
         sample_ptxas = "\n".join(

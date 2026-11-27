@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 namespace siligemma {
@@ -608,6 +609,7 @@ inline ValidationError validate_runtime_contract(
     if (hdr.total_wire_bytes != expected_wire) return ValidationError::ERR_BAD_WIRE_BYTES;
 
     std::array<uint8_t, LIVE_LINEAR_COUNT> linear_seen{};
+    int32_t expected_norm_cursor = 0;
     for (uint32_t l = 0u; l < GEMMA4_NUM_LAYERS; ++l) {
         const auto& ly = layers[l];
         if (ly.layer_idx != l) return ValidationError::ERR_BAD_TOPOLOGY;
@@ -634,9 +636,11 @@ inline ValidationError validate_runtime_contract(
             if (expected_shared && n == 6) continue;
             const int32_t noff = ly.norm_offsets_f32[n];
             const uint32_t nspan = (n < 5) ? GEMMA4_HIDDEN_SIZE : ((n < 7) ? exp_hd : 1u);
-            if (noff < 0 || static_cast<uint64_t>(noff) + static_cast<uint64_t>(nspan) > NORM_SCALAR_PARAMS_FP32) {
+            if (noff != expected_norm_cursor ||
+                static_cast<uint64_t>(noff) + static_cast<uint64_t>(nspan) > NORM_SCALAR_PARAMS_FP32) {
                 return ValidationError::ERR_BAD_DIMS;
             }
+            expected_norm_cursor += static_cast<int32_t>(nspan);
         }
         const int32_t H = static_cast<int32_t>(GEMMA4_HIDDEN_SIZE);
         const int32_t Q_DIM = static_cast<int32_t>(GEMMA4_NUM_ATTN_HEADS * exp_hd);
@@ -665,6 +669,7 @@ inline ValidationError validate_runtime_contract(
         }
     }
     size_t global_ple_cnt = 0u;
+    std::array<std::pair<uint64_t, uint64_t>, LIVE_LINEAR_COUNT * 2u> wire_spans{};
     for (size_t i = 0u; i < linears.size(); ++i) {
         const auto& d = linears[i];
         if (d.in_dim <= 0 || d.out_dim <= 0 || (d.in_dim % 128) != 0 || (d.out_dim % 16) != 0 ||
@@ -673,11 +678,14 @@ inline ValidationError validate_runtime_contract(
         }
         const uint64_t wb = linear_wire_words_bytes(d.out_dim, d.in_dim);
         const uint64_t sb = linear_wire_scales_bytes(d.out_dim, d.in_dim, d.group_size);
-        if (d.words_byte_offset > hdr.total_wire_bytes || wb > (hdr.total_wire_bytes - d.words_byte_offset) ||
+        if (wb == 0ULL || sb == 0ULL ||
+            d.words_byte_offset > hdr.total_wire_bytes || wb > (hdr.total_wire_bytes - d.words_byte_offset) ||
             d.scales_byte_offset > hdr.total_wire_bytes || sb > (hdr.total_wire_bytes - d.scales_byte_offset) ||
             d.scales_byte_offset < (d.words_byte_offset + wb)) {
             return ValidationError::ERR_BAD_WIRE_BYTES;
         }
+        wire_spans[2u * i] = {d.words_byte_offset, d.words_byte_offset + wb};
+        wire_spans[2u * i + 1u] = {d.scales_byte_offset, d.scales_byte_offset + sb};
         if (linear_seen[i] == 0u) {
             if (d.layer_idx != 0xFFFFFFFFu ||
                 d.role_id != static_cast<uint32_t>(LinearRole::GLOBAL_PLE_MODEL_PROJ) ||
@@ -689,6 +697,12 @@ inline ValidationError validate_runtime_contract(
         }
     }
     if (global_ple_cnt != 1u) return ValidationError::ERR_BAD_TOPOLOGY;
+    std::sort(wire_spans.begin(), wire_spans.end());
+    for (size_t i = 1u; i < wire_spans.size(); ++i) {
+        if (wire_spans[i].first < wire_spans[i - 1u].second) {
+            return ValidationError::ERR_BAD_WIRE_BYTES;
+        }
+    }
     return ValidationError::OK;
 }
 
@@ -934,9 +948,13 @@ inline ValidationError evaluate_riccati_loop_guard(
     const float dot_val = canonical_tree_sum_block128_f32(dot_pc.data(), dim);
 
     out_step_ratio = n_diff / (n_prev + 1.0e-6f);
-    if (n_prev > 1.0e-12f && n_cur > 1.0e-12f) {
-        out_cos = dot_val / (n_prev * n_cur);
-    } else if (n_diff <= 1.0e-12f) {
+    if (n_prev > 0.0f && n_cur > 0.0f) {
+        const double denom = static_cast<double>(n_prev) * static_cast<double>(n_cur);
+        double raw_cos = static_cast<double>(dot_val) / denom;
+        if (raw_cos > 1.0) raw_cos = 1.0;
+        if (raw_cos < -1.0) raw_cos = -1.0;
+        out_cos = static_cast<float>(raw_cos);
+    } else if (n_prev == 0.0f && n_cur == 0.0f) {
         out_cos = 1.0f;
     } else {
         out_cos = 0.0f;
@@ -957,7 +975,8 @@ inline ValidationError evaluate_riccati_loop_guard(
         }
     }
 
-    if (!std::isfinite(out_step_ratio) || out_step_ratio >= S164_STEP_RATIO_LIMIT || out_cos < LOOP_EXIT_COS_MIN) {
+    if (!std::isfinite(out_cos) || !std::isfinite(out_step_ratio) ||
+        out_step_ratio >= S164_STEP_RATIO_LIMIT || out_cos < LOOP_EXIT_COS_MIN) {
         return ValidationError::ERR_S164_STEP_DIVERGENCE;
     }
     return ValidationError::OK;

@@ -360,16 +360,21 @@ static void compute_batch_nll_cpu(
         const uint32_t tgt = targets[b];
         if (tgt >= static_cast<uint32_t>(vocab_size)) continue;
         const float* row = logits + static_cast<size_t>(b) * static_cast<size_t>(vocab_size);
-        float max_v = -1.0e30f;
+        float max_v = 0.0f;
         for (int v = 0; v < vocab_size; ++v) {
-            if (row[v] > max_v) max_v = row[v];
+            SG_REQUIRE(std::isfinite(row[v]), "Non-finite logit in compute_batch_nll_cpu");
+            if (v == 0 || row[v] > max_v) max_v = row[v];
         }
         double sum_exp = 0.0;
         for (int v = 0; v < vocab_size; ++v) {
             sum_exp += std::exp(static_cast<double>(row[v] - max_v));
         }
+        SG_REQUIRE(std::isfinite(sum_exp) && sum_exp > 0.0, "Non-finite log-sum-exp denominator in compute_batch_nll_cpu");
         const double lse = static_cast<double>(max_v) + std::log(sum_exp);
-        nll_sum += lse - static_cast<double>(row[tgt]);
+        const double tok_nll = lse - static_cast<double>(row[tgt]);
+        SG_REQUIRE(std::isfinite(tok_nll), "Non-finite per-token NLL in compute_batch_nll_cpu");
+        nll_sum += tok_nll;
+        SG_REQUIRE(std::isfinite(nll_sum), "Non-finite NLL accumulator in compute_batch_nll_cpu");
         tok_cnt += 1u;
     }
 }
@@ -1506,7 +1511,10 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
                     compute_batch_nll_cpu(h_logits.data(), next_tgts.data(), 16, static_cast<int>(siligemma::GEMMA4_VOCAB_SIZE), nll_sum, tok_cnt);
                 }
                 g_w.destroy();
-                return nll_sum / static_cast<double>(tok_cnt);
+                SG_REQUIRE(tok_cnt > 0ULL, "Zero WT2 tokens evaluated");
+                const double mean_nll = nll_sum / static_cast<double>(tok_cnt);
+                SG_REQUIRE(std::isfinite(mean_nll), "Non-finite mean WT2 NLL");
+                return mean_nll;
             };
             wt2_cuda_k1_bf16 = eval_wt2_cuda(1, false);
             wt2_cuda_k1_4p5 = eval_wt2_cuda(1, true);
@@ -1727,6 +1735,51 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
             hub_overhead_pct = (hub_steer_ms - hub_base_ms) / std::max(hub_base_ms, 1e-9) * 100.0;
             g_hs.destroy();
             g_hb.destroy();
+        }
+
+        // Final SECDED / IRIS canary gate covering allocation, throughput, and hub-steering sections
+        SG_REQUIRE(
+            siligemma::evaluate_canary_watchdog(*host_canary, 0u, false) == siligemma::WatchdogAction::CONTINUE,
+            "Watchdog SAFE_HALT_DED_ROLLBACK triggered during allocation/throughput/hub sections"
+        );
+
+        // Fail closed on any non-finite measurement before emitting JSON
+        auto require_finite_metric = [](double v, const char* name) {
+            if (!std::isfinite(v)) {
+                std::fprintf(stderr, "Non-finite benchmark metric %s\n", name);
+                std::exit(1);
+            }
+        };
+        require_finite_metric(vram_128k_used_mib, "arena_128k_vram_mib");
+        require_finite_metric(vram_64k_used_mib, "arena_64k_shadow_vram_mib");
+        require_finite_metric(dma_stall_b1_no_ms, "dma_stall_b1_no_dma_ms");
+        require_finite_metric(dma_stall_b1_with_ms, "dma_stall_b1_with_dma_ms");
+        require_finite_metric(dma_stall_b1_pct, "dma_stall_b1_pct");
+        require_finite_metric(max_dp4a_gemv_drift, "dp4a_gemv_max_abs_diff_vs_fp32_ref");
+        require_finite_metric(sec_repair_err, "secded_sec_repair_max_err");
+        require_finite_metric(max_wb_norm_drift, "woodbury_max_rel_norm_drift");
+        require_finite_metric(wb_med_us, "woodbury_hoisted_d1536_us");
+        require_finite_metric(euc_med_us, "euclidean_lora_d1536_us");
+        require_finite_metric(wb_overhead_pct_d1536, "woodbury_hoisted_overhead_pct");
+        require_finite_metric(hub_max_norm_drift, "hub_l10_14_max_rel_norm_drift");
+        require_finite_metric(hub_base_ms, "hub_l10_14_base_ms");
+        require_finite_metric(hub_steer_ms, "hub_l10_14_steer_ms");
+        require_finite_metric(hub_overhead_pct, "hub_l10_14_overhead_pct");
+        if (wt2_cuda_measured) {
+            require_finite_metric(wt2_cuda_k1_bf16, "wt2_cuda_k1_bf16_nll");
+            require_finite_metric(wt2_cuda_k1_4p5, "wt2_cuda_k1_4p5_nll");
+            require_finite_metric(wt2_cuda_k2_bf16, "wt2_cuda_k2_bf16_nll");
+            require_finite_metric(wt2_cuda_k3_bf16, "wt2_cuda_k3_bf16_nll");
+            require_finite_metric(wt2_cuda_k2_step_ratio, "wt2_cuda_k2_step_ratio");
+            require_finite_metric(wt2_cuda_k2_cos, "wt2_cuda_k2_cos");
+            require_finite_metric(wt2_cuda_k3_rho_hat, "wt2_cuda_k3_rho_hat");
+            require_finite_metric(wt2_cuda_k3_step_ratio, "wt2_cuda_k3_step_ratio");
+            require_finite_metric(wt2_cuda_k3_cos, "wt2_cuda_k3_cos");
+        }
+        for (const auto& r : tp_results) {
+            require_finite_metric(r.median_ms, "throughput.median_ms");
+            require_finite_metric(r.p95_ms, "throughput.p95_ms");
+            require_finite_metric(r.tok_per_s, "throughput.tok_per_s");
         }
 
         // Write structured JSON out
