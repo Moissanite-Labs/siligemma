@@ -317,8 +317,23 @@ static int cmd_pack(const char* st_path, const char* slgb_path, const char* jobs
 
     int fd_in = ::open(st_path, O_RDONLY);
     if (fd_in < 0) { std::perror("open input safetensors"); return 1; }
+    struct stat st_in{};
+    if (::fstat(fd_in, &st_in) != 0 || st_in.st_size <= 0) {
+        std::fprintf(stderr, "Invalid input safetensors size\n");
+        ::close(fd_in);
+        return 1;
+    }
+    const uint64_t in_file_bytes = static_cast<uint64_t>(st_in.st_size);
     int fd_out = ::open(slgb_path, O_RDWR | O_CREAT, 0644);
     if (fd_out < 0) { std::perror("open output slgb"); ::close(fd_in); return 1; }
+    struct stat st_out{};
+    if (::fstat(fd_out, &st_out) != 0) {
+        std::perror("fstat output slgb");
+        ::close(fd_in);
+        ::close(fd_out);
+        return 1;
+    }
+    const uint64_t out_file_bytes = static_cast<uint64_t>(st_out.st_size);
 
     std::ifstream jf(jobs_path);
     if (!jf) {
@@ -335,6 +350,9 @@ static int cmd_pack(const char* st_path, const char* slgb_path, const char* jobs
     std::vector<float> f32_buf;
     uint64_t total_linears_done = 0u;
     uint64_t total_norms_done = 0u;
+    auto span_fits = [](uint64_t off, uint64_t len, uint64_t lim) -> bool {
+        return off <= lim && len <= (lim - off);
+    };
 
     while (std::getline(jf, line)) {
         if (line.empty()) continue;
@@ -346,6 +364,15 @@ static int cmd_pack(const char* st_path, const char* slgb_path, const char* jobs
             uint64_t in_off = 0, out_w_off = 0, out_s_off = 0;
             if (!(iss >> m >> k >> in_off >> out_w_off >> out_s_off) || m <= 0 || k <= 0 || (k % 32) != 0) {
                 std::fprintf(stderr, "Malformed LINEAR job line\n");
+                return 1;
+            }
+            const uint64_t in_bytes = static_cast<uint64_t>(m) * static_cast<uint64_t>(k) * 2ULL;
+            const uint64_t w_bytes = static_cast<uint64_t>(m) * static_cast<uint64_t>(k / 16) * 8ULL;
+            const uint64_t s_bytes = static_cast<uint64_t>(m) * static_cast<uint64_t>(k / 32) * 2ULL;
+            if (!span_fits(in_off, in_bytes, in_file_bytes) ||
+                !span_fits(out_w_off, w_bytes, out_file_bytes) ||
+                !span_fits(out_s_off, s_bytes, out_file_bytes)) {
+                std::fprintf(stderr, "LINEAR job offset/span out of bounds\n");
                 return 1;
             }
             const size_t n_elems = static_cast<size_t>(m) * static_cast<size_t>(k);
@@ -363,6 +390,16 @@ static int cmd_pack(const char* st_path, const char* slgb_path, const char* jobs
             if (!(iss >> total_rows >> k >> chunk_rows >> in_off >> out_emb_off >> out_w_off >> out_s_off) ||
                 total_rows <= 0 || k <= 0 || chunk_rows <= 0 || (k % 32) != 0) {
                 std::fprintf(stderr, "Malformed EMBED job line\n");
+                return 1;
+            }
+            const uint64_t emb_bytes = static_cast<uint64_t>(total_rows) * static_cast<uint64_t>(k) * 2ULL;
+            const uint64_t w_bytes = static_cast<uint64_t>(total_rows) * static_cast<uint64_t>(k / 16) * 8ULL;
+            const uint64_t s_bytes = static_cast<uint64_t>(total_rows) * static_cast<uint64_t>(k / 32) * 2ULL;
+            if (!span_fits(in_off, emb_bytes, in_file_bytes) ||
+                !span_fits(out_emb_off, emb_bytes, out_file_bytes) ||
+                !span_fits(out_w_off, w_bytes, out_file_bytes) ||
+                !span_fits(out_s_off, s_bytes, out_file_bytes)) {
+                std::fprintf(stderr, "EMBED job offset/span out of bounds\n");
                 return 1;
             }
             for (int r0 = 0; r0 < total_rows; r0 += chunk_rows) {
@@ -387,6 +424,11 @@ static int cmd_pack(const char* st_path, const char* slgb_path, const char* jobs
             uint64_t in_off = 0, out_off = 0;
             if (!(iss >> cnt >> in_off >> out_off) || cnt == 0u) {
                 std::fprintf(stderr, "Malformed NORM job line\n");
+                return 1;
+            }
+            if (!span_fits(in_off, static_cast<uint64_t>(cnt) * 2ULL, in_file_bytes) ||
+                !span_fits(out_off, static_cast<uint64_t>(cnt) * 4ULL, out_file_bytes)) {
+                std::fprintf(stderr, "NORM job offset/span out of bounds\n");
                 return 1;
             }
             bf16_buf.resize(cnt);
@@ -486,6 +528,10 @@ static int cmd_verify(const char* slgb_path) {
 }
 
 static int cmd_selftest_quant(const char* in_bf16_path, int m, int k, const char* out_w_path, const char* out_s_path) {
+    if (m <= 0 || k <= 0 || (k % 32) != 0) {
+        std::fprintf(stderr, "Invalid selftest-quant dims: m=%d k=%d\n", m, k);
+        return 1;
+    }
     std::fesetround(FE_TONEAREST);
     const CosetTable ct = build_coset_table();
     const size_t n = static_cast<size_t>(m) * static_cast<size_t>(k);

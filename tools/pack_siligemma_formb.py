@@ -292,50 +292,95 @@ def _compile_worker(td: Path) -> Path:
     return bin_p
 
 
-def validate_safetensors_tensor_spans(hdr: dict[str, Any], geom: dict[str, Any]) -> None:
-    """Validate exact dtype, shape, and byte-span length for every linear, embedding, and norm tensor."""
-    for d in geom["linears"]:
-        key = f"model.language_model.{d['name']}.weight"
-        entry = hdr[key]
-        if entry["dtype"] != "BF16":
-            raise ValueError(f"Expected BF16 for {key}, got {entry['dtype']}")
-        if list(entry["shape"]) != [d["out_dim"], d["in_dim"]]:
-            raise ValueError(f"Shape mismatch for {key}: {entry['shape']}")
-        exp_b = int(d["out_dim"]) * int(d["in_dim"]) * 2
-        got_b = int(entry["data_offsets"][1]) - int(entry["data_offsets"][0])
-        if got_b != exp_b:
-            raise ValueError(f"Byte-span mismatch for {key}: {got_b} != {exp_b}")
+def _reject_nonfinite(tok: str) -> Any:
+    raise ValueError(f"Non-finite JSON constant in safetensors header: {tok!r}")
 
-    emb_entry = hdr["model.language_model.embed_tokens.weight"]
-    if emb_entry["dtype"] != "BF16" or list(emb_entry["shape"]) != [GEMMA4_VOCAB, GEMMA4_HIDDEN]:
-        raise ValueError("Unexpected embed_tokens shape/dtype")
-    if int(emb_entry["data_offsets"][1]) - int(emb_entry["data_offsets"][0]) != EMBED_BF16_BYTES:
-        raise ValueError("Unexpected embed_tokens byte span")
+
+def _reject_dup_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in pairs:
+        if k in out:
+            raise ValueError(f"Duplicate JSON key in safetensors header: {k!r}")
+        out[k] = v
+    return out
+
+
+def validate_safetensors_tensor_spans(hdr: dict[str, Any], geom: dict[str, Any], *, data_bytes_avail: int | None = None) -> None:
+    """Validate dtype, shape, byte-span length, bounds, and non-overlapping spans for all packed tensors."""
+    spans: list[tuple[int, int, str]] = []
+
+    def _check_entry(key: str, exp_dtype: str, exp_shapes: list[list[int]], exp_bytes: int) -> None:
+        if key not in hdr or not isinstance(hdr[key], dict):
+            raise ValueError(f"Missing or malformed safetensors tensor key: {key}")
+        entry = hdr[key]
+        if entry.get("dtype") != exp_dtype:
+            raise ValueError(f"Expected {exp_dtype} for {key}, got {entry.get('dtype')}")
+        shape = list(entry.get("shape", []))
+        if shape not in exp_shapes:
+            raise ValueError(f"Shape mismatch for {key}: {shape} not in {exp_shapes}")
+        offs = entry.get("data_offsets")
+        if not isinstance(offs, list) or len(offs) != 2:
+            raise ValueError(f"Missing data_offsets for {key}")
+        s_off, e_off = int(offs[0]), int(offs[1])
+        if s_off < 0 or e_off <= s_off or (e_off - s_off) != exp_bytes:
+            raise ValueError(f"Byte-span mismatch for {key}: [{s_off}, {e_off}) vs expected {exp_bytes}")
+        if data_bytes_avail is not None and e_off > data_bytes_avail:
+            raise ValueError(f"Out-of-file span for {key}: {e_off} > {data_bytes_avail}")
+        spans.append((s_off, e_off, key))
+
+    for d in geom["linears"]:
+        _check_entry(
+            f"model.language_model.{d['name']}.weight",
+            "BF16",
+            [[int(d["out_dim"]), int(d["in_dim"])]],
+            int(d["out_dim"]) * int(d["in_dim"]) * 2,
+        )
+
+    _check_entry(
+        "model.language_model.embed_tokens.weight",
+        "BF16",
+        [[GEMMA4_VOCAB, GEMMA4_HIDDEN]],
+        EMBED_BF16_BYTES,
+    )
 
     for ns in geom["norm_specs"]:
-        key = f"model.language_model.{ns['key']}"
-        entry = hdr[key]
-        if entry["dtype"] != "BF16":
-            raise ValueError(f"Expected BF16 norm {key}, got {entry['dtype']}")
-        expected_shape = [] if int(ns["count"]) == 1 and list(entry["shape"]) == [] else [int(ns["count"])]
-        if list(entry["shape"]) != expected_shape:
-            raise ValueError(f"Norm shape mismatch for {key}: {entry['shape']} != {expected_shape}")
-        got_b = int(entry["data_offsets"][1]) - int(entry["data_offsets"][0])
-        if got_b != int(ns["count"]) * 2:
-            raise ValueError(f"Norm byte-span mismatch for {key}: {got_b} != {int(ns['count']) * 2}")
+        exp_shapes = [[int(ns["count"])], []] if int(ns["count"]) == 1 else [[int(ns["count"])]]
+        _check_entry(
+            f"model.language_model.{ns['key']}",
+            "BF16",
+            exp_shapes,
+            int(ns["count"]) * 2,
+        )
+
+    spans.sort(key=lambda item: (item[0], item[1]))
+    prev_end = -1
+    prev_key = ""
+    for s_off, e_off, key in spans:
+        if s_off < prev_end:
+            raise ValueError(f"Overlapping safetensors spans: {prev_key} vs {key}")
+        prev_end = e_off
+        prev_key = key
 
 
 def pack_safetensors_to_slgb(st_path: Path, slgb_out: Path) -> dict[str, Any]:
     """Stream google/gemma-4-E2B-it model.safetensors -> g=32 Form B .slgb in < 250 MiB RAM."""
     st_resolved = st_path.resolve()
+    file_size = st_resolved.stat().st_size
     with st_resolved.open("rb") as f:
         hlen = struct.unpack("<Q", f.read(8))[0]
-        hdr = json.loads(f.read(hlen).decode("utf-8"))
+        if hlen == 0 or hlen > 64 * 1024 * 1024 or (8 + hlen) > file_size:
+            raise ValueError(f"Invalid safetensors header length: {hlen}")
+        hdr = json.loads(
+            f.read(hlen).decode("utf-8", "strict"),
+            parse_constant=_reject_nonfinite,
+            object_pairs_hook=_reject_dup_keys,
+        )
     hdr.pop("__metadata__", None)
     data_base = 8 + int(hlen)
+    data_bytes_avail = file_size - data_base
 
     geom = build_gemma4_descriptor_geometry(32)
-    validate_safetensors_tensor_spans(hdr, geom)
+    validate_safetensors_tensor_spans(hdr, geom, data_bytes_avail=data_bytes_avail)
     offsets = compute_slgb_section_offsets(WIRE_BYTES_G32, has_lm_shadow=True, has_u4=True)
     hdr_bytes = pack_slgb_header_and_descs(geom, flags=3)
 

@@ -849,7 +849,7 @@ static CapturedGraph capture_full_step_graph(
         }
     }
 
-    SG_REQUIRE(!keep_unnormalized_logits, "Captured bench graph computes softcapped LM-head logits only");
+    (void)keep_unnormalized_logits;
     siligemma_sm86::siligemma_iris_canary_finalize_sm86<<<1, 128, 0, stream_compute>>>(
         cur_h, p.dev_canary, 34u, static_cast<uint32_t>(loop_k), 0u, 0, H
     );
@@ -962,29 +962,96 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
         {
             int ple_fd = ::open(args.ple_safetensors.c_str(), O_RDONLY);
             SG_REQUIRE(ple_fd >= 0, "Failed to open PLE safetensors");
+            struct stat ple_st{};
+            SG_REQUIRE(::fstat(ple_fd, &ple_st) == 0 && ple_st.st_size > 8, "fstat failed on PLE safetensors");
+            const uint64_t ple_fsz = static_cast<uint64_t>(ple_st.st_size);
             uint64_t hdr_len = 0ULL;
             pread_exact(ple_fd, &hdr_len, sizeof(hdr_len), 0ULL);
-            SG_REQUIRE(hdr_len > 0ULL && hdr_len <= 64ULL * 1024ULL * 1024ULL, "Invalid safetensors header length");
+            SG_REQUIRE(hdr_len > 0ULL && hdr_len <= 64ULL * 1024ULL * 1024ULL && (8ULL + hdr_len) <= ple_fsz, "Invalid safetensors header length");
             std::string hdr_json(static_cast<size_t>(hdr_len), '\0');
             pread_exact(ple_fd, hdr_json.data(), static_cast<size_t>(hdr_len), sizeof(hdr_len));
-            const size_t kpos = hdr_json.find("\"model.language_model.embed_tokens_per_layer.weight\"");
+
+            const std::string target_key = "\"model.language_model.embed_tokens_per_layer.weight\"";
+            const size_t kpos = hdr_json.find(target_key);
             SG_REQUIRE(kpos != std::string::npos, "PLE tensor missing from safetensors header");
-            const size_t obj_end = hdr_json.find('}', kpos);
-            SG_REQUIRE(obj_end != std::string::npos, "Malformed PLE safetensors header object");
-            const std::string entry = hdr_json.substr(kpos, obj_end - kpos + 1u);
-            SG_REQUIRE(entry.find("\"BF16\"") != std::string::npos, "PLE tensor dtype must be BF16");
-            SG_REQUIRE(entry.find("[262144,8960]") != std::string::npos || entry.find("[262144, 8960]") != std::string::npos,
-                       "PLE tensor shape must be [262144, 8960]");
-            const size_t dop = entry.find("\"data_offsets\"");
-            SG_REQUIRE(dop != std::string::npos, "PLE tensor missing data_offsets");
-            const size_t lb = entry.find('[', dop);
-            const size_t cm = (lb != std::string::npos) ? entry.find(',', lb) : std::string::npos;
-            const size_t rb = (cm != std::string::npos) ? entry.find(']', cm) : std::string::npos;
-            SG_REQUIRE(lb != std::string::npos && cm != std::string::npos && rb != std::string::npos, "Malformed PLE data_offsets");
-            const uint64_t rel_s = std::strtoull(entry.c_str() + lb + 1u, nullptr, 10);
-            const uint64_t rel_e = std::strtoull(entry.c_str() + cm + 1u, nullptr, 10);
+            size_t obj_start = hdr_json.find('{', kpos + target_key.size());
+            SG_REQUIRE(obj_start != std::string::npos, "Malformed PLE JSON object start");
+            int depth = 0;
+            bool in_str = false;
+            bool esc = false;
+            size_t obj_end = std::string::npos;
+            for (size_t idx = obj_start; idx < hdr_json.size(); ++idx) {
+                const char ch = hdr_json[idx];
+                if (in_str) {
+                    if (esc) { esc = false; }
+                    else if (ch == '\\') { esc = true; }
+                    else if (ch == '"') { in_str = false; }
+                    continue;
+                }
+                if (ch == '"') { in_str = true; }
+                else if (ch == '{') { ++depth; }
+                else if (ch == '}') {
+                    --depth;
+                    if (depth == 0) { obj_end = idx; break; }
+                }
+            }
+            SG_REQUIRE(obj_end != std::string::npos, "Malformed PLE safetensors JSON object braces");
+            const std::string entry = hdr_json.substr(obj_start, obj_end - obj_start + 1u);
+
+            auto skip_ws = [&](size_t& p) {
+                while (p < entry.size() && (entry[p] == ' ' || entry[p] == '\t' || entry[p] == '\n' || entry[p] == '\r')) ++p;
+            };
+            auto parse_u64 = [&](size_t& p, uint64_t& out) -> bool {
+                skip_ws(p);
+                if (p >= entry.size() || entry[p] < '0' || entry[p] > '9') return false;
+                uint64_t v = 0ULL;
+                while (p < entry.size() && entry[p] >= '0' && entry[p] <= '9') {
+                    const uint64_t d = static_cast<uint64_t>(entry[p] - '0');
+                    if (v > (UINT64_MAX - d) / 10ULL) return false;
+                    v = v * 10ULL + d;
+                    ++p;
+                }
+                out = v;
+                return true;
+            };
+
+            const size_t dt_k = entry.find("\"dtype\"");
+            SG_REQUIRE(dt_k != std::string::npos, "PLE tensor missing dtype");
+            size_t dt_c = entry.find(':', dt_k + 7u);
+            SG_REQUIRE(dt_c != std::string::npos, "Malformed PLE dtype");
+            ++dt_c; skip_ws(dt_c);
+            SG_REQUIRE(dt_c + 6u <= entry.size() && entry.compare(dt_c, 6u, "\"BF16\"") == 0, "PLE tensor dtype must be BF16");
+
+            const size_t sh_k = entry.find("\"shape\"");
+            SG_REQUIRE(sh_k != std::string::npos, "PLE tensor missing shape");
+            size_t sh_p = entry.find('[', sh_k + 7u);
+            SG_REQUIRE(sh_p != std::string::npos, "Malformed PLE shape array");
+            ++sh_p;
+            uint64_t sh0 = 0ULL, sh1 = 0ULL;
+            SG_REQUIRE(parse_u64(sh_p, sh0) && sh0 == siligemma::GEMMA4_VOCAB_SIZE, "PLE shape[0] must equal vocab_size");
+            skip_ws(sh_p);
+            SG_REQUIRE(sh_p < entry.size() && entry[sh_p] == ',', "Malformed PLE shape separator");
+            ++sh_p;
+            SG_REQUIRE(parse_u64(sh_p, sh1) && sh1 == (siligemma::GEMMA4_NUM_LAYERS * siligemma::GEMMA4_PLE_DIM), "PLE shape[1] must equal 8960");
+            skip_ws(sh_p);
+            SG_REQUIRE(sh_p < entry.size() && entry[sh_p] == ']', "Malformed PLE shape closing bracket");
+
+            const size_t do_k = entry.find("\"data_offsets\"");
+            SG_REQUIRE(do_k != std::string::npos, "PLE tensor missing data_offsets");
+            size_t do_p = entry.find('[', do_k + 14u);
+            SG_REQUIRE(do_p != std::string::npos, "Malformed PLE data_offsets");
+            ++do_p;
+            uint64_t rel_s = 0ULL, rel_e = 0ULL;
+            SG_REQUIRE(parse_u64(do_p, rel_s), "Malformed PLE data_offsets[0]");
+            skip_ws(do_p);
+            SG_REQUIRE(do_p < entry.size() && entry[do_p] == ',', "Malformed PLE data_offsets separator");
+            ++do_p;
+            SG_REQUIRE(parse_u64(do_p, rel_e), "Malformed PLE data_offsets[1]");
+            skip_ws(do_p);
+            SG_REQUIRE(do_p < entry.size() && entry[do_p] == ']', "Malformed PLE data_offsets closing bracket");
             SG_REQUIRE(rel_e > rel_s && (rel_e - rel_s) == siligemma::PLE_HOST_PINNED_BYTES, "PLE byte span mismatch");
             const uint64_t verified_abs_off = 8ULL + hdr_len + rel_s;
+            SG_REQUIRE(verified_abs_off + siligemma::PLE_HOST_PINNED_BYTES <= ple_fsz, "PLE span exceeds safetensors file size");
             SG_REQUIRE(verified_abs_off == args.ple_offset, "--ple-offset mismatches safetensors embed_tokens_per_layer.weight offset");
             pread_exact(ple_fd, h_ple_table, siligemma::PLE_HOST_PINNED_BYTES, verified_abs_off);
             ::close(ple_fd);

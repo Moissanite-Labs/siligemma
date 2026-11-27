@@ -41,16 +41,16 @@ if str(TOOLS_DIR) not in sys.path:
 import pack_siligemma_formb as packer  # noqa: E402
 
 EXPECTED_PINNED_SHA256 = {
-    "Makefile": "02e03b0adb77c744d6c9c8d1771ff2b4777b638fd5a731d507fbd917cb20ca9f",
+    "Makefile": "7cb15397c024c1f0cc47efb6a9b67fad17b6a276023e5631e1366cb56e7271df",
     "docs/ARCHITECTURE_FORMB_SILIGEMMA.md": "b7410d0c491748632585f884115d8241efe0b837290ce164e78fe41a0b074fd6",
     "docs/PREREG_W22_GEMMA4_FORMB.json": "03724afa55d9008675225ae48cf78bc2fdcd180418ec6a5ad60a4e15facf37e0",
     "docs/STAGE1_REPORT.md": "86f95ebae659922693853c030723d120996dd8d56de82cb875c922076023af99",
     "docs/STAGE1_VERDICT.json": "d67403ae29265313d163e93ea0184ef5eb9c17e4a5786c89bff186540df4c97b",
-    "kernels/siligemma_arena.hpp": "03515456d218fb2e5efb39f777fffd20d1435df173f70e2222bf08257d619c16",
-    "kernels/siligemma_bench_sm86.cu": "485186a74800c30cb9812c51086e764290aed7eccb2b875bfbbb68edfb671ec8",
+    "kernels/siligemma_arena.hpp": "768456361de57d98e22088fab43fcb80afb095f309d5db04f9d2ec286b3a9eb5",
+    "kernels/siligemma_bench_sm86.cu": "d037841cb21336eb8fa2c134ed939612ec09d12e8a79f2bd67ed53a1aeb802f3",
     "kernels/siligemma_kernels_sm86.cu": "5ee2e547bcacc0b14659160645c0044b32accf10e0c4326db97f55d440413818",
-    "tools/pack_siligemma_formb.py": "b0a9a73b15477140ee83045ec0bacf509524c7d51b97c054d0d2759702ef16ee",
-    "tools/slgb_cpu_worker.cpp": "2b0c4579680de3526635bba85bda93523274e66aec0a8175410ba3848f7d28f3",
+    "tools/pack_siligemma_formb.py": "64a17571ea4eaeef59435b35baa088aee6b1a6ab2aadf96284243461b5e4dcd6",
+    "tools/slgb_cpu_worker.cpp": "3596864bfad54d393d727f4fc57e108ed5eaf52cf79a2b673e78f9ba418c8bba",
 }
 
 MAX_KERNEL_REGS = 48
@@ -364,6 +364,9 @@ int main() {{
     auto bad_crc_hdr = hdr32_f3;
     bad_crc_hdr.header_crc32 ^= 0x1u;
     if (siligemma::validate_slgb_file_layout(bad_crc_hdr, layers32_f3, lin32_f3, exp_sz, true) != siligemma::ValidationError::ERR_BAD_CRC32) return 18;
+    auto zero_crc_hdr = hdr32_f3;
+    zero_crc_hdr.header_crc32 = 0u;
+    if (siligemma::validate_slgb_file_layout(zero_crc_hdr, layers32_f3, lin32_f3, exp_sz, false) != siligemma::ValidationError::OK) return 22;
     if (siligemma::validate_slgb_file_layout(hdr32_f3, layers32_f3, lin32_f3, exp_sz - 16ULL, true) != siligemma::ValidationError::ERR_BAD_FILE_SIZE) return 19;
     auto bad_lin = lin32_f3;
     bad_lin[7].words_byte_offset += 64ULL;
@@ -410,6 +413,9 @@ int main() {{
     if (siligemma::evaluate_riccati_loop_guard(prev_h.data(), bad_h.data(), prev_d.data(), D, 2u, rho_bad, sr_bad, cos_bad) != siligemma::ValidationError::ERR_RICCATI_RHO_GE_LIMIT) return 13;
     if (siligemma::evaluate_riccati_loop_guard(prev_h.data(), cur_h.data(), prev_d.data(), D, 4u, rho_ok, sr_ok, cos_ok) != siligemma::ValidationError::ERR_LOOP_K_INVALID) return 14;
     if (siligemma::evaluate_riccati_loop_guard(prev_h.data(), cur_h.data(), nullptr, D, 3u, rho_ok, sr_ok, cos_ok) != siligemma::ValidationError::ERR_BAD_DIMS) return 21;
+    std::vector<float> zero_d(D, 0.0f);
+    double rho_exact = -1.0;
+    if (siligemma::evaluate_riccati_loop_guard(prev_h.data(), prev_h.data(), zero_d.data(), D, 3u, rho_exact, sr_ok, cos_ok) != siligemma::ValidationError::OK || rho_exact != 0.0) return 23;
 
     std::printf(
         "{{\\"tree_sum_bits\\": \\"0x%08x\\", \\"sum_20k_bits\\": \\"0x%08x\\", \\"rms0_bits\\": \\"0x%08x\\", \\"rms1535_bits\\": \\"0x%08x\\", "
@@ -521,23 +527,33 @@ class TestSiliGemmaCPU(unittest.TestCase):
         self.assertEqual(got_crc, exp_crc)
         self.assertNotEqual(got_crc, 0)
 
-        # Negative control: norm tensor shape/span mismatch must fail validation
+        # Negative control: norm shape mismatch & overlapping tensor spans must fail validation
         fake_hdr: dict[str, Any] = {}
+        cur_off = 0
         for d in geom["linears"]:
+            nb = d["out_dim"] * d["in_dim"] * 2
             fake_hdr[f"model.language_model.{d['name']}.weight"] = {
-                "dtype": "BF16", "shape": [d["out_dim"], d["in_dim"]], "data_offsets": [0, d["out_dim"] * d["in_dim"] * 2]
+                "dtype": "BF16", "shape": [d["out_dim"], d["in_dim"]], "data_offsets": [cur_off, cur_off + nb]
             }
+            cur_off += nb
         fake_hdr["model.language_model.embed_tokens.weight"] = {
-            "dtype": "BF16", "shape": [packer.GEMMA4_VOCAB, packer.GEMMA4_HIDDEN], "data_offsets": [0, packer.EMBED_BF16_BYTES]
+            "dtype": "BF16", "shape": [packer.GEMMA4_VOCAB, packer.GEMMA4_HIDDEN], "data_offsets": [cur_off, cur_off + packer.EMBED_BF16_BYTES]
         }
+        cur_off += packer.EMBED_BF16_BYTES
         for ns in geom["norm_specs"]:
+            nb = ns["count"] * 2
             fake_hdr[f"model.language_model.{ns['key']}"] = {
-                "dtype": "BF16", "shape": [ns["count"]], "data_offsets": [0, ns["count"] * 2]
+                "dtype": "BF16", "shape": [ns["count"]], "data_offsets": [cur_off, cur_off + nb]
             }
-        packer.validate_safetensors_tensor_spans(fake_hdr, geom)
+            cur_off += nb
+        packer.validate_safetensors_tensor_spans(fake_hdr, geom, data_bytes_avail=cur_off)
         fake_hdr["model.language_model.norm.weight"]["shape"] = [999]
         with self.assertRaises(ValueError):
-            packer.validate_safetensors_tensor_spans(fake_hdr, geom)
+            packer.validate_safetensors_tensor_spans(fake_hdr, geom, data_bytes_avail=cur_off)
+        fake_hdr["model.language_model.norm.weight"]["shape"] = [packer.GEMMA4_HIDDEN]
+        fake_hdr["model.language_model.norm.weight"]["data_offsets"] = [0, packer.GEMMA4_HIDDEN * 2]
+        with self.assertRaises(ValueError):
+            packer.validate_safetensors_tensor_spans(fake_hdr, geom, data_bytes_avail=cur_off)
 
         verdict = parse_strict_json_bytes(read_regular_bytes_nofollow(DOCS_DIR / "STAGE1_VERDICT.json"), label="verdict")
         recomp = _recompute_s184_kill_gates(verdict["raw_measurements"])

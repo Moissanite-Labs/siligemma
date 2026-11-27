@@ -38,6 +38,10 @@ audit-sass: compile-cuda
 	@echo "ZERO_SPILL_SASS_AUDIT_PASS=1"
 
 test-cpu: $(BUILD_DIR)
+	@if [ ! -f tests/test_siligemma_cpu.py ]; then \
+		echo "ERROR: tests/test_siligemma_cpu.py lives in the weight-free source repo (Moissanite-Labs/siligemma); run 'make compile-cuda && make audit-sass' in the weight bundle." >&2; \
+		exit 2; \
+	fi
 	printf '#include "siligemma_arena.hpp"\nint main() { return 0; }\n' | CUDA_VISIBLE_DEVICES="" $(CXX) $(CXXFLAGS) -I. -Ikernels -x c++ - -lm -o "$(BUILD_DIR)/cpu_arena_ref"
 	CUDA_VISIBLE_DEVICES="" "$(BUILD_DIR)/cpu_arena_ref"
 	CUDA_VISIBLE_DEVICES="" $(CXX) $(CXXFLAGS) -I. -Ikernels tools/slgb_cpu_worker.cpp -lm -o "$(BUILD_DIR)/slgb_cpu_worker"

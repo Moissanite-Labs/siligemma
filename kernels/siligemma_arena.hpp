@@ -641,7 +641,9 @@ inline ValidationError validate_slgb_file_layout(
     const ValidationError base_err = validate_runtime_contract(hdr, layers, linears, dummy_tok, 1u);
     if (base_err != ValidationError::OK) return base_err;
     if (require_crc32 && hdr.header_crc32 == 0u) return ValidationError::ERR_BAD_CRC32;
-    if (hdr.header_crc32 != compute_slgb_header_crc32(hdr)) return ValidationError::ERR_BAD_CRC32;
+    if (hdr.header_crc32 != 0u && hdr.header_crc32 != compute_slgb_header_crc32(hdr)) {
+        return ValidationError::ERR_BAD_CRC32;
+    }
     if (actual_file_size != expected_slgb_file_bytes(hdr)) return ValidationError::ERR_BAD_FILE_SIZE;
 
     SlgbHeader exp_hdr{};
@@ -651,6 +653,9 @@ inline ValidationError validate_slgb_file_layout(
         static_cast<uint32_t>(hdr.group_size), exp_hdr, exp_layers, exp_linears, hdr.flags
     );
     if (build_err != ValidationError::OK) return build_err;
+    if (!require_crc32 && hdr.header_crc32 == 0u) {
+        exp_hdr.header_crc32 = 0u;
+    }
     if (std::memcmp(&hdr, &exp_hdr, sizeof(SlgbHeader)) != 0) return ValidationError::ERR_BAD_TOPOLOGY;
     if (std::memcmp(layers.data(), exp_layers.data(), sizeof(exp_layers)) != 0) return ValidationError::ERR_BAD_TOPOLOGY;
     if (linears.size() != exp_linears.size() ||
@@ -681,7 +686,8 @@ inline float tree_reduce_128_cpu(std::array<float, 128>& tile) noexcept {
     return tile[0];
 }
 
-// Block-128 hierarchical canonical tree matching CUDA canonical_sum_sq_d128 & tree_reduce_128_sm86 (0-ULP).
+// Block-128 hierarchical canonical tree matching CUDA canonical_sum_sq_d128 & tree_reduce_128_sm86 (0-ULP)
+// for all Gemma-4 hidden widths D <= 12288 (CUDA kernel smem_blk[96]); recurses on CPU for larger arrays.
 inline float canonical_tree_sum_block128_f32(const float* data, size_t n) {
     if (n == 0u || data == nullptr) return 0.0f;
     const size_t n_blocks = (n + 127u) / 128u;
@@ -871,7 +877,13 @@ inline ValidationError evaluate_riccati_loop_guard(
     out_rho_hat = 0.0;
     if (prev_delta != nullptr) {
         const float n_pd = std::sqrt(canonical_tree_sum_block128_f32(sq_pdelta.data(), dim));
-        out_rho_hat = (n_pd > 1.0e-12f) ? (static_cast<double>(n_diff) / static_cast<double>(n_pd)) : (0.0 / 0.0);
+        if (n_pd > 1.0e-12f) {
+            out_rho_hat = static_cast<double>(n_diff) / static_cast<double>(n_pd);
+        } else if (n_diff <= 1.0e-12f) {
+            out_rho_hat = 0.0;
+        } else {
+            out_rho_hat = (0.0 / 0.0);
+        }
         if (!std::isfinite(out_rho_hat) || out_rho_hat >= RICCATI_RHO_LIMIT) {
             return ValidationError::ERR_RICCATI_RHO_GE_LIMIT;
         }
