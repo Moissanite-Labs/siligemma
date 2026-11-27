@@ -26,7 +26,7 @@
 
 ---
 
-## Verified RTX 3080 (`sm_86`) Stage-2 Scorecard, NVML Energy & Honest Limitations
+## Measured RTX 3080 (`sm_86`) Stage-2 Scorecard, NVML Energy & Honest Limitations
 
 All GPU timings and NVML power measurements were run on an `NVIDIA GeForce RTX 3080 Laptop GPU (8,192 MiB, sm_86)` with **`energy_power_status = UNCONTROLLED_LAPTOP_NOT_CLAIMED`** (live D2D `cudaMemcpy` peak = **`357.78 GB/s`**).
 
@@ -44,7 +44,7 @@ All GPU timings and NVML power measurements were run on an `NVIDIA GeForce RTX 3
 > [!NOTE]
 > Energy readings are not guaranteed to be consistent due to uncontrollable variables (thermal state, ambient temperature, fan curve, and dynamic power limits). *(Measured via `100 Hz` NVML INA3221 rail trapezoidal integration cross-checked within `<= 0.95 W` by `100 ms` `nvidia-smi`; see `nvmlDeviceGetTotalEnergyConsumption` drift disclosure in [`ahrazzle/SiliGemma-1.0`](https://huggingface.co/ahrazzle/SiliGemma-1.0).)*
 
-- **Honest Stage-2 Gate Disposition (`STAGE2_VERDICT.json`: `KG-GFB1=PASS`, `KG-GFB2=PASS`, `KG-GFB3=FAIL`, `KG-GFB4=PASS`):**
+- **Honest Stage-2 Gate Disposition (`STAGE2_VERDICT.json`: `overall_verdict = FAIL_GATE` — `KG-GFB1=PASS`, `KG-GFB2=PASS`, `KG-GFB3=FAIL`, `KG-GFB4=PASS`, `provenance_tag = UNCONTROLLED_LAPTOP_NOT_CLAIMED`):**
   - Stage-2 resolved Stage-1's parity (`KG-GFB1 PASS`: `0.8598 -> 6.509e-5`) and batched Tensor Core (`B=16`: `873.20 / 805.62 / 699.23 tok/s`) targets.
   - `KG-GFB3` stays honestly `FAIL` solely because single-stream canonical `0`-ULP `B=1` hit `135.02 / 111.23 / 106.15 / 91.50 tok/s` (`173.12–206.99 GB/s`) below the strict `150 / 122 / 120 / 98 tok/s` floor (bounded by serial per-layer norm synchronization and small-matrix occupancy relative to the `357.78 GB/s` D2D stream peak).
   - *Note on `slgb-v1` vs `slgb-v2`:* The shipped standalone `gemma4_formb_g32.slgb` archive (`slgb-v1`, `flags=3`) initializes the `U-4` slot to `K=1` identity (`wf=0, wg=0, mq=0`); `siligemma_bench_sm86` loads both `slgb-v1` and Stage-2 `slgb-v2` directly.
