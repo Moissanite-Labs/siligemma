@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  r4-cpu-parity-and-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Hygiene, leak, CRLF, zero-weights, and zero-bare-assert check
+        run: |
+          python3 -I -B - <<'PY'
+          import ast
+          from pathlib import Path
+          import re
+
+          root = Path(".")
+          slash = chr(47)
+          rx_home = re.compile(slash + "ho" + "me" + slash + r"[A-Za-z0-9._-]+")
+          rx_users = re.compile(slash + "Us" + "ers" + slash + r"[A-Za-z0-9._-]+")
+          for p in sorted(root.rglob("*")):
+              if ".git" in p.parts:
+                  continue
+              if p.is_symlink():
+                  raise SystemExit(f"Symlink forbidden: {p}")
+              if p.name == "__pycache__" or p.suffix in (".pyc", ".pyo", ".safetensors", ".slgb", ".so", ".o", ".bin", ".pt", ".pth"):
+                  raise SystemExit(f"Forbidden build/weight artifact: {p}")
+              if p.is_file():
+                  raw = p.read_bytes()
+                  if raw[:4] == b"\x7fELF":
+                      raise SystemExit(f"ELF binary forbidden: {p}")
+              if p.is_file() and p.suffix in (".py", ".md", ".txt", ".json", ".yml", ".yaml", ".toml", ".c", ".cpp", ".hpp", ".cu", ".cuh"):
+                  if b"\r" in raw:
+                      raise SystemExit(f"CRLF line ending in {p}")
+                  txt = raw.decode("utf-8")
+                  if rx_home.search(txt) or rx_users.search(txt):
+                      raise SystemExit(f"Host user path leak in {p}")
+                  if p.suffix == ".py":
+                      tree = ast.parse(txt, filename=str(p))
+                      for node in ast.walk(tree):
+                          if isinstance(node, ast.Assert):
+                              raise SystemExit(f"Bare assert in {p}:{getattr(node, 'lineno', 0)}")
+          print("HYGIENE_PASS=1")
+          PY
+
+      - name: Run 3x -I isolated parity pure-CPU & C++20 reference suite
+        run: |
+          CUDA_VISIBLE_DEVICES="" python3 -I -B tests/test_siligemma_cpu.py > /tmp/r4_b.out
+          CUDA_VISIBLE_DEVICES="" python3 -I -O -B tests/test_siligemma_cpu.py > /tmp/r4_ob.out
+          CUDA_VISIBLE_DEVICES="" python3 -I -B -W error tests/test_siligemma_cpu.py > /tmp/r4_werr.out
+          cmp -s /tmp/r4_b.out /tmp/r4_ob.out
+          cmp -s /tmp/r4_b.out /tmp/r4_werr.out
+          rm -f /tmp/r4_b.out /tmp/r4_ob.out /tmp/r4_werr.out
+          echo "R4_3X_ISOLATED_PARITY_PASS=1"

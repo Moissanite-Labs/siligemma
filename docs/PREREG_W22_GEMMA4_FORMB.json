@@ -1,0 +1,251 @@
+{
+  "schema": "aletheia.w22.preregistration.v2",
+  "prereg_id": "PREREG-W22-GEMMA4-FORMB",
+  "track_id": "TRACK-S184",
+  "queue_id": "EXP-Q81",
+  "milestone": "M3",
+  "status": "PREREGISTERED_DESIGN_AND_ROOFLINE_SPEC",
+  "title": "SiliGemma-Native sm_86: End-to-End Bare-Metal Gemma-4 Form B Rework (0 B Alloc, Async PLE DMA, Fused dp4a+IRIS, L10..14 Hub + L25..33 0 B-KV Loop)",
+  "hardware_and_governance_invariants": {
+    "design_stage_execution_mode": "CPU_ONLY_ANALYTICAL_SPEC",
+    "cuda_visible_devices_during_spec": "",
+    "max_spec_ram_mib": 400,
+    "model_weights_loaded_during_spec": false,
+    "weights_in_expedition_repo": 0,
+    "elf_binaries_in_track_dir": 0,
+    "path_hygiene": "DOLLAR_HOME_ONLY",
+    "no_claude_policy": "ENFORCED_STRICTLY",
+    "target_gpu": "NVIDIA GeForce RTX 3080 Laptop GPU",
+    "compute_capability": "sm_86",
+    "energy_power_status": "UNCONTROLLED_LAPTOP_NOT_CLAIMED",
+    "measured_gpu_stream_triad_bytes_per_s": 356680000000,
+    "measured_pcie_gen4_dma_bytes_per_s": 16000000000,
+    "gpu_vram_total_mib": 8192,
+    "gpu_vram_usable_cap_bytes": 6979321856,
+    "host_ram_usable_cap_bytes": 26843545600,
+    "zero_third_party_runtime_anchors": [
+      "transformers",
+      "peft",
+      "torch.nn.Module",
+      "cuBLAS",
+      "siliquant-hf-v1_CSR_formA"
+    ]
+  },
+  "target_model_pin": {
+    "model_id": "google/gemma-4-E2B-it",
+    "snapshot_revision": "4adf15748de9e1a0097b6274cee9c15836c41c37",
+    "config_json_path": "$HOME/.cache/huggingface/hub/models--google--gemma-4-E2B-it/snapshots/4adf15748de9e1a0097b6274cee9c15836c41c37/config.json",
+    "config_json_sha256": "1b28f3d2c3100f6c594754b81107428bd7b822a7f48272ca681dae9d2ec38330",
+    "bos_token_id": 2,
+    "eos_token_ids": [1, 106],
+    "pad_token_id": 0,
+    "vocab_size": 262144,
+    "hidden_size": 1536,
+    "num_hidden_layers": 35,
+    "num_kv_shared_layers": 20,
+    "num_attention_heads": 8,
+    "num_key_value_heads": 1,
+    "sliding_head_dim": 256,
+    "global_head_dim": 512,
+    "sliding_window": 512,
+    "intermediate_size_l0_14": 6144,
+    "intermediate_size_l15_34": 12288,
+    "hidden_size_per_layer_input": 256,
+    "final_logit_softcapping": 30.0,
+    "rms_norm_eps": 1e-6,
+    "tie_word_embeddings": true,
+    "full_attention_layers": [4, 9, 14, 19, 24, 29, 34],
+    "full_attention_rope": {
+      "rope_type": "proportional",
+      "partial_rotary_factor": 0.25,
+      "rope_theta": 1000000.0,
+      "rotated_pairs": 64,
+      "nope_pairs": 192
+    },
+    "sliding_attention_rope": {
+      "rope_type": "default",
+      "rope_theta": 10000.0,
+      "rotated_pairs": 128
+    }
+  },
+  "pinned_anchors_sha256": {
+    "s180c_stage1_report": {
+      "path": "$HOME/Projects/expedition/track-s180c-hoist-optimization-s1/STAGE1_REPORT.md",
+      "sha256": "db4695698add0675d6791f69907fa8364c4b72bb6d259a193962f89c6bbdd216"
+    },
+    "s180c_stage1_verdict": {
+      "path": "$HOME/Projects/expedition/track-s180c-hoist-optimization-s1/STAGE1_VERDICT.json",
+      "sha256": "e52b4aab65964b6dd739d6d8f16c0680b82ec6a78381541adabd7fe7a5557cad"
+    },
+    "s180c_hoist_bench_cu": {
+      "path": "$HOME/Projects/expedition/track-s180c-hoist-optimization-s1/s180c_hoist_bench.cu",
+      "sha256": "b08477c047d2efd91a8ee8741ecba6aaa21d5c980b3e81258cc47b9bf2fd8c41"
+    },
+    "s180_holosphere_cu": {
+      "path": "$HOME/Projects/expedition/track-s180-silinative-holosphere-s1/silinative_a16_lora4_sm86.cu",
+      "sha256": "a62ea47a83efc024afcc00340360de2382bc5381dbca1a4e6b9d216f6888ef12"
+    },
+    "canonical_hoist_sm86_cuh": {
+      "path": "$HOME/Projects/publish/siliqwen/kernels/canonical_hoist_sm86.cuh",
+      "sha256": "8f72138ab4990edc98bd1300acde0456e583676b9c913b89478b4b4de2cd9a85"
+    },
+    "sililoop_py": {
+      "path": "$HOME/Projects/publish/siliqwen/siliqwen/sililoop.py",
+      "sha256": "eff1ef37ec800fb5959cfb6937d179551b160e2e2dd3433cdbab8f22e4426d4b"
+    },
+    "s182_functor_full": {
+      "path": "$HOME/Projects/expedition/track-s182-gemma4-siliquant-s1/QWEN_TO_GEMMA4_FUNCTOR_FULL.md",
+      "sha256": "6fd701588a7b6e9f8b6f35f20e878605eda6707ea87d7a83e85e3d57a5e1bf9b"
+    },
+    "s182_prep_report": {
+      "path": "$HOME/Projects/expedition/track-s182-gemma4-siliquant-s1/GEMMA4_PREP_REPORT.md",
+      "sha256": "0105b2672171c08e9c17dc61fa59d703891d5119b19f46aad99b492c886eb7fe"
+    },
+    "s182b2_stage1_report": {
+      "path": "$HOME/Projects/expedition/track-s182b2-gemma4-bos-fix/STAGE1_REPORT.md",
+      "sha256": "7ec9c1299ad5bcf0c017325f046575b016bf586b60ecc0ea696e0a6302f3cec7"
+    },
+    "s182d_sililoop_design": {
+      "path": "$HOME/Projects/expedition/track-s182d-siliqwen-loop/DESIGN_S182D_SILILOOP.md",
+      "sha256": "8c9e0b60e94490a28e371f1ee3a4e1644106d39ad35b96badd2a0df3c2e2fbd8"
+    },
+    "s183_verify_roofline_py": {
+      "path": "$HOME/Projects/expedition/track-s183-inkling2-mini-s1/verify_s183_roofline.py",
+      "sha256": "c81f748286a262d397cf5141294bed2218daba88b085d61a82fcd735f4168dfd"
+    },
+    "s183b_fusion_plan": {
+      "path": "$HOME/Projects/expedition/track-s183b-inkling2-fusion-s1/INKLING2_DEEP_FUSION_PLAN.md",
+      "sha256": "db3da49e31a3e17e2256e33f38391d98a2fb983f2aa87d8d0a0d9ba5398513ce"
+    },
+    "forward_unlocks_p223_p224": {
+      "path": "$HOME/Projects/expedition/scratch/FORWARD_UNLOCKS_P223_P224_INKLING_SILIQWEN.md",
+      "sha256": "1ee3463abe95199fbf54a246306bb103a3abbcc075f7dfa4595cea825bcf5f04"
+    },
+    "portals_p223": {
+      "path": "$HOME/Projects/expedition/scratch/PORTALS_P223_LOOP_TUNE_ZED.md",
+      "sha256": "d49ad23559b6b302b3a8650e57ba4510ecfbb575d091e0883c72e32e2c6baf50"
+    },
+    "portals_p224": {
+      "path": "$HOME/Projects/expedition/scratch/PORTALS_P224_CHIP_SAT_SGM.md",
+      "sha256": "f0168005f18958791d00af7ab96f00e385a09c75434f1a1ca632ad381834dc0a"
+    }
+  },
+  "exact_memory_and_wire_budgets": {
+    "live_2d_linear_tensors": 276,
+    "live_2d_linear_params": 1876819968,
+    "pruned_dead_kv_tensors_absent": 60,
+    "pruned_dead_kv_params_absent": 18880512,
+    "norm_scalar_params_fp32": 285987,
+    "norm_scalar_bytes_fp32": 1143948,
+    "norm_scalar_bytes_fp32_aligned_256b": 1144064,
+    "embed_tokens_params": 402653184,
+    "embed_tokens_bytes_bf16": 805306368,
+    "lm_head_shadow_bytes_g32_4p5bpw": 226492416,
+    "ple_host_pinned_params": 2348810240,
+    "ple_host_pinned_bytes_bf16": 4697620480,
+    "ple_dma_bytes_per_token": 17920,
+    "ple_dma_time_pcie16_us_b1": 1.12,
+    "wire_bytes_g32_4p5bpw": 1055711232,
+    "wire_bytes_g128_4p125bpw": 967735296,
+    "u4_loop_controller_layers": [25, 26, 27, 28, 29, 30, 31, 32, 33],
+    "u4_loop_controller_gates": ["q", "mlp", "ple"],
+    "u4_loop_controller_rank": 16,
+    "u4_loop_controller_params": 2695680,
+    "u4_loop_controller_bytes_bf16": 5391360,
+    "u4_loop_segment_linear_params": 579600384,
+    "u4_loop_segment_bytes_g32": 326025216,
+    "u4_loop_segment_bytes_g128": 298856448,
+    "kv_ring_sliding_slots_capped": 512,
+    "kv_ring_sliding_bytes_total": 6291456,
+    "kv_ring_bytes_t16384": 106954752,
+    "kv_ring_bytes_t65536": 408944640,
+    "kv_ring_bytes_t131072": 811597824,
+    "extra_kv_bytes_for_l15_34_and_k2_k3": 0,
+    "static_arena_bytes_t16384_g32": 1995364608,
+    "static_arena_bytes_t65536_g32_plus_lm_shadow": 2523846912,
+    "static_arena_bytes_t131072_g32": 2700007680,
+    "dynamic_runtime_cuda_alloc_bytes": 0
+  },
+  "kernel_and_roofline_budgets": {
+    "max_stack_bytes": 0,
+    "max_spill_load_bytes": 0,
+    "max_spill_store_bytes": 0,
+    "max_ldl_stl_insns": 0,
+    "max_bulk_gemv_registers": 48,
+    "woodbury_const_buffer_bytes": 256,
+    "woodbury_hoisted_r4_regs": 56,
+    "woodbury_hoisted_overhead_s180c_pct": {
+      "d512_batch16": -19.57,
+      "d1536_graph": 3.44
+    },
+    "canonical_reduction_tree": "tree_reduce_128_sm86",
+    "canonical_tree_ulp_drift": 0,
+    "iris_canary_bytes": 64,
+    "iris_canary_struct": "HoloSphereRazorCanary64",
+    "secded_code": "[16,11,4]_1_LOP3_5_POPC",
+    "roofline_b1_356p68_gbs_g32": {
+      "k1_35l_body_only_ideal_tok_s": 337.86,
+      "k1_35l_4p5_lmhead_ideal_tok_s": 278.18,
+      "k1_35l_4p5_lmhead_80pct_tok_s": 222.54,
+      "k2_44l_4p5_lmhead_ideal_tok_s": 221.78,
+      "k2_44l_4p5_lmhead_80pct_tok_s": 177.43,
+      "k3_53l_4p5_lmhead_ideal_tok_s": 184.4,
+      "k3_53l_4p5_lmhead_80pct_tok_s": 147.52,
+      "k1_35l_bf16_lmhead_ideal_tok_s": 191.66,
+      "k1_35l_bf16_lmhead_80pct_tok_s": 153.33,
+      "k2_44l_bf16_lmhead_ideal_tok_s": 163.09,
+      "k2_44l_bf16_lmhead_80pct_tok_s": 130.47,
+      "k3_53l_bf16_lmhead_ideal_tok_s": 141.93,
+      "k3_53l_bf16_lmhead_80pct_tok_s": 113.54
+    },
+    "roofline_b16_t1024_80pct_tok_s_g32_4p5_lmhead": {
+      "k1_35l": 3077.5,
+      "k2_44l": 2523.0,
+      "k3_53l": 2137.8
+    }
+  },
+  "kill_gates": {
+    "KG-GFB1": {
+      "title": "Zero-Anchor Wire Parity, bos=2 Gate, Async PLE DMA, & Static 0 B-Alloc Arena",
+      "pass_criteria": [
+        "0 imports or runtime calls to transformers, peft, torch.nn.Module, or cuBLAS",
+        "bos_token_id == 2 enforced fail-closed in header and initial token buffer",
+        "276 live linears in 1055711232 B (g=32) or 967735296 B (g=128) and 0 of 60 dead L15..34 k/v/k_norm tensors stored",
+        "cuda_free_vram_delta_bytes == 0 and host_heap_delta_bytes == 0 across K=1,2,3 decode",
+        "17920 B/tok PLE host->device cudaMemcpyAsync stall <= 2% of step time",
+        "Peak VRAM <= 3072 MiB up to 128K ctx and max abs logit drift <= 1e-3 vs S182b2 Form A G0_Base_A16"
+      ],
+      "fail_disposition": "KILL_FALSIFIED"
+    },
+    "KG-GFB2": {
+      "title": "0 B-Spill sm_86 Kernel Hygiene, 0-ULP Reduction Tree, IRIS+SECDED, & Hoist Overhead",
+      "pass_criteria": [
+        "100% kernels pass nvcc --ptxas-options=-v --Werror all-warnings with 0 B stack/spill and 0 LDL/STL",
+        "Bulk fused Sandwich-RMSNorm + Block-H4 + A_16 dp4a GEMV uses <= 48 registers",
+        "tree_reduce_128_sm86 exhibits 0 ULP drift across CTA, warp, and batch configs",
+        "a16_secded_lop3_popc_syndrome + IRIS HoloSphereRazorCanary64 reports 0 clean syndromes and 100% SafeHalt kill on injected single/double bit and Trojan trace mutants",
+        "Hoisted c_wb_inv_256b 8x8 Cayley-Woodbury steering overhead <= +25% (targeting S180c -19.57%/+3.44%)"
+      ],
+      "fail_disposition": "KILL_FALSIFIED"
+    },
+    "KG-GFB3": {
+      "title": "RTX 3080 Roofline Floor & L10..L14 20x Norm-Clamped Hub Steering Interface",
+      "pass_criteria": [
+        "B=1 CUDA Graph decode achieves >= 190 tok/s (4.5bpw lm_head shadow) or >= 135 tok/s (BF16 lm_head) at K=1 (35L)",
+        "B=1 CUDA Graph decode achieves >= 155 tok/s (4.5bpw lm_head shadow) or >= 115 tok/s (BF16 lm_head) at K=2 (44L)",
+        "L10..L14 Cayley-Woodbury hub steering preserves row L2 norms within 1e-6, holds WT2 drift <= +0.03 nats, and writes 0 KV bytes inside [15..34]"
+      ],
+      "fail_disposition": "KILL_FALSIFIED"
+    },
+    "KG-GFB4": {
+      "title": "U-4 T_{Inkling2->Gemma4} L25..L33 0 B-KV Adaptive Loop Contraction & Reasoning Lift",
+      "pass_criteria": [
+        "K in {1,2,3} looping of L25..L33 (44L/53L effective depth) with 2695680-param r=16 BF16 (q,mlp,ple) controllers allocates exactly 0 B extra KV cache",
+        "K=1 zero-init matches unlooped 35L logits within <= 1e-5 max abs diff",
+        "Empirical return spectral proxy satisfies rho_hat < 0.6180 (G3 <= 2) and S164 relative step norm < 1.5 across all passes",
+        "K=2 holds WT2 NLL drift <= +0.05 nats and improves disjoint Countdown/OOD NLL by >= +0.015 nats over K=1"
+      ],
+      "fail_disposition": "KILL_FALSIFIED"
+    }
+  }
+}
