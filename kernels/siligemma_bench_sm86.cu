@@ -358,7 +358,7 @@ static void compute_batch_nll_cpu(
 ) {
     for (int b = 0; b < batch_size; ++b) {
         const uint32_t tgt = targets[b];
-        if (tgt >= static_cast<uint32_t>(vocab_size)) continue;
+        SG_REQUIRE(tgt < static_cast<uint32_t>(vocab_size), "Out-of-range target token in compute_batch_nll_cpu");
         const float* row = logits + static_cast<size_t>(b) * static_cast<size_t>(vocab_size);
         float max_v = 0.0f;
         for (int v = 0; v < vocab_size; ++v) {
@@ -838,6 +838,7 @@ static CapturedGraph capture_full_step_graph(
 
     // Final model.norm + LM Head (+ softcap=30.0) + argmax
     if (use_4p5_lm_head) {
+        SG_REQUIRE(m.has_lm_shadow && m.hdr.group_size == 32u, "4.5 bpw LM-head shadow requires flags&1 and group_size=32");
         siligemma_sm86::siligemma_sandwich_norm_u4_q8_sm86<<<batch_size, 128, 0, stream_compute>>>(
             cur_h, p.d_model_norm, nullptr, p.d_x_q8, p.d_x_sc, nullptr, eps, H
         );
@@ -1449,10 +1450,16 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
             }
             std::vector<float> logits_out(siligemma::GEMMA4_VOCAB_SIZE);
             SG_CUDA_OK(cudaMemcpy(logits_out.data(), ptrs.d_logits, logits_out.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            for (float v : logits_out) {
+                SG_REQUIRE(std::isfinite(v), "Non-finite logit in prompt dump");
+            }
             std::ofstream ofs(out_path, std::ios::binary | std::ios::trunc);
             SG_REQUIRE(ofs.good(), "Failed opening logits dump path");
             ofs.write(reinterpret_cast<const char*>(logits_out.data()), static_cast<std::streamsize>(logits_out.size() * sizeof(float)));
+            ofs.flush();
+            SG_REQUIRE(ofs.good(), "Failed writing logits dump path");
             ofs.close();
+            SG_REQUIRE(!ofs.fail(), "Failed closing logits dump path");
             g_prompt.destroy();
         };
         run_prompt_and_dump(false, args.dump_logits_bf16);
@@ -1851,7 +1858,10 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
             }
             jout << "  ]\n";
             jout << "}\n";
+            jout.flush();
+            SG_REQUIRE(jout.good(), "Failed writing --json-out");
             jout.close();
+            SG_REQUIRE(!jout.fail(), "Failed closing --json-out");
         }
 
         SG_CUDA_OK(cudaEventDestroy(ev_dma_done));

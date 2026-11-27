@@ -316,13 +316,15 @@ def validate_safetensors_tensor_spans(hdr: dict[str, Any], geom: dict[str, Any],
         entry = hdr[key]
         if entry.get("dtype") != exp_dtype:
             raise ValueError(f"Expected {exp_dtype} for {key}, got {entry.get('dtype')}")
-        shape = list(entry.get("shape", []))
-        if shape not in exp_shapes:
-            raise ValueError(f"Shape mismatch for {key}: {shape} not in {exp_shapes}")
+        sh_raw = entry.get("shape")
+        if not isinstance(sh_raw, list) or any(type(d) is not int for d in sh_raw):
+            raise ValueError(f"Non-integer shape for {key}: {sh_raw!r}")
+        if sh_raw not in exp_shapes:
+            raise ValueError(f"Shape mismatch for {key}: {sh_raw} not in {exp_shapes}")
         offs = entry.get("data_offsets")
-        if not isinstance(offs, list) or len(offs) != 2:
-            raise ValueError(f"Missing data_offsets for {key}")
-        s_off, e_off = int(offs[0]), int(offs[1])
+        if not isinstance(offs, list) or len(offs) != 2 or type(offs[0]) is not int or type(offs[1]) is not int:
+            raise ValueError(f"Missing or non-integer data_offsets for {key}: {offs!r}")
+        s_off, e_off = offs[0], offs[1]
         if s_off < 0 or e_off <= s_off or (e_off - s_off) != exp_bytes:
             raise ValueError(f"Byte-span mismatch for {key}: [{s_off}, {e_off}) vs expected {exp_bytes}")
         if data_bytes_avail is not None and e_off > data_bytes_avail:

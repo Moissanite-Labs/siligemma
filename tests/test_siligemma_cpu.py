@@ -46,11 +46,11 @@ EXPECTED_PINNED_SHA256 = {
     "docs/PREREG_W22_GEMMA4_FORMB.json": "03724afa55d9008675225ae48cf78bc2fdcd180418ec6a5ad60a4e15facf37e0",
     "docs/STAGE1_REPORT.md": "86f95ebae659922693853c030723d120996dd8d56de82cb875c922076023af99",
     "docs/STAGE1_VERDICT.json": "d67403ae29265313d163e93ea0184ef5eb9c17e4a5786c89bff186540df4c97b",
-    "kernels/siligemma_arena.hpp": "357f2b94f88510d5389769a6eded1b135070a2137a48b9dfd84c962a69ba8249",
-    "kernels/siligemma_bench_sm86.cu": "035fed719316a12cc5f2212ad525ed2ca1ce02f82a7bf5abe43836066bf14c09",
+    "kernels/siligemma_arena.hpp": "dd44365c2f43577c10df625cb958fb386567507d787f01d26f79533b9849fb23",
+    "kernels/siligemma_bench_sm86.cu": "bbc026e88570066ab8695362ec1bae02a9ea6e7a959ec8c38eb5b1ab0852113e",
     "kernels/siligemma_kernels_sm86.cu": "5ee2e547bcacc0b14659160645c0044b32accf10e0c4326db97f55d440413818",
-    "tools/pack_siligemma_formb.py": "26f8be7875cd7612addfc89cdfd3d06efb32fed2b7cd03a18749703bca968be3",
-    "tools/slgb_cpu_worker.cpp": "1f9220b2470934dfe58acc498a998b7823442a5bb4e6fabe72ea32dbcbae2ccb",
+    "tools/pack_siligemma_formb.py": "689ed377f7bd32061c0bf01561bae2a665c2b2320b282e77a87e540f75a97faf",
+    "tools/slgb_cpu_worker.cpp": "da51f06391612947efeebf66fa3b2224ff6f02701829fd14ca3ed7bed42e6516",
 }
 
 MAX_KERNEL_REGS = 48
@@ -396,6 +396,11 @@ int main() {{
         auto zero_rt_hdr = hdr32;
         zero_rt_hdr.header_crc32 = 0u;
         if (siligemma::validate_runtime_contract(zero_rt_hdr, layers32, lin32, ok_toks, 3u, true) != siligemma::ValidationError::ERR_BAD_CRC32) return 27;
+        if (siligemma::build_gemma4_descriptor_table(128u, hdr128, layers128, lin128, 1u) != siligemma::ValidationError::ERR_BAD_TOPOLOGY) return 32;
+        auto bad_g128 = hdr128;
+        bad_g128.flags = 1u;
+        bad_g128.header_crc32 = siligemma::compute_slgb_header_crc32(bad_g128);
+        if (siligemma::validate_runtime_contract(bad_g128, layers128, lin128, ok_toks, 3u) != siligemma::ValidationError::ERR_BAD_TOPOLOGY) return 33;
     }}
 
     uint32_t rng = 184099u;
@@ -583,6 +588,9 @@ class TestSiliGemmaCPU(unittest.TestCase):
         fake_hdr["model.language_model.norm.weight"]["data_offsets"] = [0, packer.GEMMA4_HIDDEN * 2]
         with self.assertRaises(ValueError):
             packer.validate_safetensors_tensor_spans(fake_hdr, geom, data_bytes_avail=cur_off)
+        fake_hdr["model.language_model.norm.weight"]["data_offsets"] = [0.9, packer.GEMMA4_HIDDEN * 2 + 0.9]
+        with self.assertRaises(ValueError):
+            packer.validate_safetensors_tensor_spans(fake_hdr, geom, data_bytes_avail=cur_off)
 
         verdict = parse_strict_json_bytes(read_regular_bytes_nofollow(DOCS_DIR / "STAGE1_VERDICT.json"), label="verdict")
         recomp = _recompute_s184_kill_gates(verdict["raw_measurements"])
@@ -669,6 +677,11 @@ class TestSiliGemmaCPU(unittest.TestCase):
             nan_p.write_bytes(struct.pack(f"<{m * k}H", *nan_vals))
             q_nan = subprocess.run([str(worker), "--selftest-quant", str(nan_p), str(m), str(k), str(w_p), str(s_p)], capture_output=True, text=True, check=False)
             self.assertNotEqual(q_nan.returncode, 0)
+
+            ovf_p = td_p / "ovf.bf16"
+            ovf_p.write_bytes(struct.pack(f"<{m * k}H", *([0x7F7F] * (m * k))))
+            q_ovf = subprocess.run([str(worker), "--selftest-quant", str(ovf_p), str(m), str(k), str(w_p), str(s_p)], capture_output=True, text=True, check=False)
+            self.assertNotEqual(q_ovf.returncode, 0)
 
     def test_05_r5_ptxas_and_sass_must_fail_controls(self) -> None:
         sample_ptxas = "\n".join(

@@ -240,11 +240,20 @@ static bool quantize_rows_g32(
             float d01 = x0 - x1;
             float s23 = x2 + x3;
             float d23 = x2 - x3;
-            row_rot[c + 0] = 0.5f * (s01 + s23);
-            row_rot[c + 1] = 0.5f * (d01 + d23);
-            row_rot[c + 2] = 0.5f * (s01 - s23);
-            row_rot[c + 3] = 0.5f * (d01 - d23);
+            float y0 = 0.5f * (s01 + s23);
+            float y1 = 0.5f * (d01 + d23);
+            float y2 = 0.5f * (s01 - s23);
+            float y3 = 0.5f * (d01 - d23);
+            if (!std::isfinite(y0) || !std::isfinite(y1) || !std::isfinite(y2) || !std::isfinite(y3)) {
+                saw_nonfinite.store(true, std::memory_order_relaxed);
+                break;
+            }
+            row_rot[c + 0] = y0;
+            row_rot[c + 1] = y1;
+            row_rot[c + 2] = y2;
+            row_rot[c + 3] = y3;
         }
+        if (saw_nonfinite.load(std::memory_order_relaxed)) continue;
 
         for (int g = 0; g < g_per_row; ++g) {
             const float* xg = &row_rot[static_cast<size_t>(g) * 32u];
@@ -254,14 +263,26 @@ static bool quantize_rows_g32(
                 if (a > amax) amax = a;
             }
             float sc = std::max(amax / 7.25f, 1.0e-7f);
+            if (!std::isfinite(amax) || !std::isfinite(sc) || sc <= 0.0f) {
+                saw_nonfinite.store(true, std::memory_order_relaxed);
+                break;
+            }
             float z[16];
             int32_t y_tmp[32];
 
             for (int it = 0; it < 2; ++it) {
                 for (int b = 0; b < 2; ++b) {
-                    for (int i = 0; i < 16; ++i) z[i] = xg[b * 16 + i] / sc;
+                    for (int i = 0; i < 16; ++i) {
+                        z[i] = xg[b * 16 + i] / sc;
+                        if (!std::isfinite(z[i])) {
+                            saw_nonfinite.store(true, std::memory_order_relaxed);
+                            break;
+                        }
+                    }
+                    if (saw_nonfinite.load(std::memory_order_relaxed)) break;
                     ml_snap_a16_signed4_block16(z, ct, &y_tmp[b * 16]);
                 }
+                if (saw_nonfinite.load(std::memory_order_relaxed)) break;
                 float den = 0.0f;
                 float num = 0.0f;
                 for (int i = 0; i < 32; ++i) {
@@ -271,14 +292,31 @@ static bool quantize_rows_g32(
                 }
                 den = std::max(den, 1.0f);
                 sc = std::max(std::fabs(num / den), 1.0e-7f);
+                if (!std::isfinite(den) || !std::isfinite(num) || !std::isfinite(sc) || sc <= 0.0f) {
+                    saw_nonfinite.store(true, std::memory_order_relaxed);
+                    break;
+                }
             }
+            if (saw_nonfinite.load(std::memory_order_relaxed)) break;
 
             const uint16_t sc_f16 = f32_to_f16_ieee(sc);
-            const float sc_eff = std::max(f16_to_f32_ieee(sc_f16), 1.0e-7f);
+            const float sc_raw = f16_to_f32_ieee(sc_f16);
+            if (!std::isfinite(sc_raw)) {
+                saw_nonfinite.store(true, std::memory_order_relaxed);
+                break;
+            }
+            const float sc_eff = std::max(sc_raw, 1.0e-7f);
             row_s[g] = sc_f16;
 
             for (int b = 0; b < 2; ++b) {
-                for (int i = 0; i < 16; ++i) z[i] = xg[b * 16 + i] / sc_eff;
+                for (int i = 0; i < 16; ++i) {
+                    z[i] = xg[b * 16 + i] / sc_eff;
+                    if (!std::isfinite(z[i])) {
+                        saw_nonfinite.store(true, std::memory_order_relaxed);
+                        break;
+                    }
+                }
+                if (saw_nonfinite.load(std::memory_order_relaxed)) break;
                 int32_t y_fin[16];
                 ml_snap_a16_signed4_block16(z, ct, y_fin);
                 uint64_t w64 = 0ULL;
@@ -434,8 +472,6 @@ static int cmd_pack(const char* st_path, const char* slgb_path, const char* jobs
                 bf16_buf.resize(n_elems);
                 uint64_t src_byte = in_off + static_cast<uint64_t>(r0) * static_cast<uint64_t>(k) * 2ULL;
                 pread_exact(fd_in, bf16_buf.data(), n_elems * sizeof(uint16_t), src_byte);
-                uint64_t dst_emb = out_emb_off + static_cast<uint64_t>(r0) * static_cast<uint64_t>(k) * 2ULL;
-                pwrite_exact(fd_out, bf16_buf.data(), n_elems * sizeof(uint16_t), dst_emb);
 
                 words_buf.resize(static_cast<size_t>(r_cnt) * static_cast<size_t>(k / 16));
                 scales_buf.resize(static_cast<size_t>(r_cnt) * static_cast<size_t>(k / 32));
@@ -444,6 +480,8 @@ static int cmd_pack(const char* st_path, const char* slgb_path, const char* jobs
                     ::close(fd_out);
                     return 1;
                 }
+                uint64_t dst_emb = out_emb_off + static_cast<uint64_t>(r0) * static_cast<uint64_t>(k) * 2ULL;
+                pwrite_exact(fd_out, bf16_buf.data(), n_elems * sizeof(uint16_t), dst_emb);
                 uint64_t dst_w = out_w_off + static_cast<uint64_t>(r0) * static_cast<uint64_t>(k / 16) * 8ULL;
                 uint64_t dst_s = out_s_off + static_cast<uint64_t>(r0) * static_cast<uint64_t>(k / 32) * 2ULL;
                 pwrite_exact(fd_out, words_buf.data(), words_buf.size() * sizeof(uint64_t), dst_w);

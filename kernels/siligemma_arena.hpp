@@ -314,7 +314,7 @@ constexpr SiliGemmaArenaLayout compute_siligemma_arena_layout(
     cur = align_up_n(cur + lay.sz_p2_embed_bf16, 256ULL);
 
     lay.off_p2_lm_shadow = cur;
-    lay.sz_p2_lm_shadow = with_lm_head_shadow ? LM_HEAD_SHADOW_G32_BYTES : 0ULL;
+    lay.sz_p2_lm_shadow = (with_lm_head_shadow && group_size == 32u) ? LM_HEAD_SHADOW_G32_BYTES : 0ULL;
     cur = align_up_n(cur + lay.sz_p2_lm_shadow, 256ULL);
 
     // Partition 3: FP32 norms & layer_scalars (285,987 params -> 1,144,064 B aligned)
@@ -445,7 +445,7 @@ inline ValidationError build_gemma4_descriptor_table(
     if (group_size != 32u && group_size != 128u) {
         return ValidationError::ERR_BAD_GROUP_SIZE;
     }
-    if (flags > 3u) {
+    if (flags > 3u || (group_size == 128u && (flags & 1u) != 0u)) {
         return ValidationError::ERR_BAD_TOPOLOGY;
     }
 
@@ -601,6 +601,7 @@ inline ValidationError validate_runtime_contract(
         return ValidationError::ERR_BAD_CRC32;
     }
     if (hdr.group_size != 32u && hdr.group_size != 128u) return ValidationError::ERR_BAD_GROUP_SIZE;
+    if (hdr.group_size == 128u && (hdr.flags & 1u) != 0u) return ValidationError::ERR_BAD_TOPOLOGY;
     if (hdr.num_live_linears != LIVE_LINEAR_COUNT || linears.size() != LIVE_LINEAR_COUNT ||
         hdr.num_dead_kv_omitted != DEAD_KV_TENSORS_OMITTED) {
         return ValidationError::ERR_BAD_LINEAR_COUNT;
