@@ -4,8 +4,8 @@
 Compiles `slgb_cpu_worker.cpp` into a temporary directory (deleted on exit), streams tensors
 one at a time from `model.safetensors` (< 250 MiB peak RAM, zero PyTorch / GPU locks), packs
 `gemma4_formb_g32.slgb` (276 live A_16-BlockH4 g=32 linears, 60 dead KV tensors omitted,
-BF16 embed_tokens + 4.5 bpw lm_head shadow, 247 FP32 norms, zero-init K=1 identity U-4 slot),
-and verifies 100% of [16, 11, 4] Extended Hamming syndromes.
+BF16 embed_tokens + 4.5 bpw lm_head shadow, 262 FP32 norms/scalars, zero-init K=1 identity U-4 slot),
+and verifies full [16, 11, 4] Extended Hamming syndromes.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 from typing import Any
+import zlib
 
 sys.dont_write_bytecode = True
 
@@ -194,8 +195,9 @@ def compute_slgb_section_offsets(wire_bytes: int, *, has_lm_shadow: bool = True,
 
 
 def pack_slgb_header_and_descs(geom: dict[str, Any], *, flags: int = 3) -> bytes:
-    hdr = struct.pack(
-        "<7I6H2fQ2I",
+    group_size = int(geom["linears"][0]["group_size"])
+    hdr_prefix = struct.pack(
+        "<7I6H2fQI",
         SLGB_MAGIC,
         SLGB_VERSION,
         GEMMA4_BOS_ID,
@@ -206,15 +208,16 @@ def pack_slgb_header_and_descs(geom: dict[str, Any], *, flags: int = 3) -> bytes
         GEMMA4_HIDDEN,
         GEMMA4_NUM_LAYERS,
         20,
-        32,
+        group_size,
         LIVE_LINEAR_COUNT,
         DEAD_KV_OMITTED,
         GEMMA4_SOFTCAP,
         GEMMA4_RMS_EPS,
         int(geom["total_wire_bytes"]),
         int(flags),
-        0,
     )
+    crc = zlib.crc32(hdr_prefix + b"\x00\x00\x00\x00") & 0xFFFFFFFF
+    hdr = hdr_prefix + struct.pack("<I", crc)
     chunks = [hdr]
     for ly in geom["layers"]:
         chunks.append(struct.pack(
@@ -245,6 +248,8 @@ def pack_slgb_header_and_descs(geom: dict[str, Any], *, flags: int = 3) -> bytes
 
 def _f32_to_bf16_u16(val: float) -> int:
     u = struct.unpack("<I", struct.pack("<f", float(val)))[0]
+    if (u & 0x7FFFFFFF) > 0x7F800000:
+        return ((u >> 16) | 0x0040) & 0xFFFF
     lsb = (u >> 16) & 1
     u = (u + 0x7FFF + lsb) & 0xFFFFFFFF
     return (u >> 16) & 0xFFFF
@@ -287,6 +292,39 @@ def _compile_worker(td: Path) -> Path:
     return bin_p
 
 
+def validate_safetensors_tensor_spans(hdr: dict[str, Any], geom: dict[str, Any]) -> None:
+    """Validate exact dtype, shape, and byte-span length for every linear, embedding, and norm tensor."""
+    for d in geom["linears"]:
+        key = f"model.language_model.{d['name']}.weight"
+        entry = hdr[key]
+        if entry["dtype"] != "BF16":
+            raise ValueError(f"Expected BF16 for {key}, got {entry['dtype']}")
+        if list(entry["shape"]) != [d["out_dim"], d["in_dim"]]:
+            raise ValueError(f"Shape mismatch for {key}: {entry['shape']}")
+        exp_b = int(d["out_dim"]) * int(d["in_dim"]) * 2
+        got_b = int(entry["data_offsets"][1]) - int(entry["data_offsets"][0])
+        if got_b != exp_b:
+            raise ValueError(f"Byte-span mismatch for {key}: {got_b} != {exp_b}")
+
+    emb_entry = hdr["model.language_model.embed_tokens.weight"]
+    if emb_entry["dtype"] != "BF16" or list(emb_entry["shape"]) != [GEMMA4_VOCAB, GEMMA4_HIDDEN]:
+        raise ValueError("Unexpected embed_tokens shape/dtype")
+    if int(emb_entry["data_offsets"][1]) - int(emb_entry["data_offsets"][0]) != EMBED_BF16_BYTES:
+        raise ValueError("Unexpected embed_tokens byte span")
+
+    for ns in geom["norm_specs"]:
+        key = f"model.language_model.{ns['key']}"
+        entry = hdr[key]
+        if entry["dtype"] != "BF16":
+            raise ValueError(f"Expected BF16 norm {key}, got {entry['dtype']}")
+        expected_shape = [] if int(ns["count"]) == 1 and list(entry["shape"]) == [] else [int(ns["count"])]
+        if list(entry["shape"]) != expected_shape:
+            raise ValueError(f"Norm shape mismatch for {key}: {entry['shape']} != {expected_shape}")
+        got_b = int(entry["data_offsets"][1]) - int(entry["data_offsets"][0])
+        if got_b != int(ns["count"]) * 2:
+            raise ValueError(f"Norm byte-span mismatch for {key}: {got_b} != {int(ns['count']) * 2}")
+
+
 def pack_safetensors_to_slgb(st_path: Path, slgb_out: Path) -> dict[str, Any]:
     """Stream google/gemma-4-E2B-it model.safetensors -> g=32 Form B .slgb in < 250 MiB RAM."""
     st_resolved = st_path.resolve()
@@ -297,6 +335,7 @@ def pack_safetensors_to_slgb(st_path: Path, slgb_out: Path) -> dict[str, Any]:
     data_base = 8 + int(hlen)
 
     geom = build_gemma4_descriptor_geometry(32)
+    validate_safetensors_tensor_spans(hdr, geom)
     offsets = compute_slgb_section_offsets(WIRE_BYTES_G32, has_lm_shadow=True, has_u4=True)
     hdr_bytes = pack_slgb_header_and_descs(geom, flags=3)
 
@@ -304,18 +343,12 @@ def pack_safetensors_to_slgb(st_path: Path, slgb_out: Path) -> dict[str, Any]:
     for d in geom["linears"]:
         key = f"model.language_model.{d['name']}.weight"
         entry = hdr[key]
-        if entry["dtype"] != "BF16":
-            raise ValueError(f"Expected BF16 for {key}, got {entry['dtype']}")
-        if list(entry["shape"]) != [d["out_dim"], d["in_dim"]]:
-            raise ValueError(f"Shape mismatch for {key}: {entry['shape']}")
         in_off = data_base + int(entry["data_offsets"][0])
         out_w = offsets["off_p1_wire"] + int(d["words_byte_offset"])
         out_s = offsets["off_p1_wire"] + int(d["scales_byte_offset"])
         job_lines.append(f"LINEAR {d['out_dim']} {d['in_dim']} {in_off} {out_w} {out_s}")
 
     emb_entry = hdr["model.language_model.embed_tokens.weight"]
-    if emb_entry["dtype"] != "BF16" or list(emb_entry["shape"]) != [GEMMA4_VOCAB, GEMMA4_HIDDEN]:
-        raise ValueError("Unexpected embed_tokens shape/dtype")
     emb_in_off = data_base + int(emb_entry["data_offsets"][0])
     lm_w_off = offsets["off_p2_lm_shadow"]
     lm_s_off = offsets["off_p2_lm_shadow"] + 201326592
@@ -324,8 +357,6 @@ def pack_safetensors_to_slgb(st_path: Path, slgb_out: Path) -> dict[str, Any]:
     for ns in geom["norm_specs"]:
         key = f"model.language_model.{ns['key']}"
         entry = hdr[key]
-        if entry["dtype"] != "BF16":
-            raise ValueError(f"Expected BF16 norm {key}, got {entry['dtype']}")
         in_off = data_base + int(entry["data_offsets"][0])
         out_off = offsets["off_p3_norms"] + int(ns["offset"]) * 4
         job_lines.append(f"NORM {ns['count']} {in_off} {out_off}")

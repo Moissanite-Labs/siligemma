@@ -164,7 +164,28 @@ enum class ValidationError : int32_t {
     ERR_RICCATI_RHO_GE_LIMIT = -115,
     ERR_S164_STEP_DIVERGENCE = -116,
     ERR_LOOP_K_INVALID = -117,
+    ERR_BAD_TOKEN_ID = -118,
+    ERR_BAD_CRC32 = -119,
+    ERR_BAD_FILE_SIZE = -120,
 };
+
+constexpr uint32_t crc32_ieee_update(uint32_t crc, uint8_t byte) noexcept {
+    crc ^= static_cast<uint32_t>(byte);
+    for (int k = 0; k < 8; ++k) {
+        const uint32_t mask = static_cast<uint32_t>(-static_cast<int32_t>(crc & 1u));
+        crc = (crc >> 1) ^ (0xEDB88320u & mask);
+    }
+    return crc;
+}
+
+inline uint32_t crc32_ieee(const void* data, size_t len) noexcept {
+    const auto* p = reinterpret_cast<const uint8_t*>(data);
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0u; i < len; ++i) {
+        crc = crc32_ieee_update(crc, p[i]);
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
 
 // ----------------------------------------------------------------------------
 // 3. Binary Header, Zero-Anchor Descriptor Table, & Static Arena Layout
@@ -387,14 +408,44 @@ inline uint64_t linear_wire_scales_bytes(int32_t out_dim, int32_t in_dim, int32_
     return uint64_t(out_dim) * uint64_t(in_dim / group_size) * sizeof(uint16_t);
 }
 
+inline uint32_t compute_slgb_header_crc32(const SlgbHeader& hdr_in) noexcept {
+    SlgbHeader hdr = hdr_in;
+    hdr.header_crc32 = 0u;
+    return crc32_ieee(&hdr, sizeof(hdr));
+}
+
+inline uint64_t expected_slgb_file_bytes(const SlgbHeader& hdr) noexcept {
+    const uint64_t hdr_bytes = sizeof(SlgbHeader)
+        + static_cast<uint64_t>(GEMMA4_NUM_LAYERS) * sizeof(SiliGemmaLayerDesc)
+        + static_cast<uint64_t>(LIVE_LINEAR_COUNT) * sizeof(SiliGemmaLinearDesc);
+    uint64_t off = align_up_n(hdr_bytes, 256ULL);
+    off = align_up_n(off + hdr.total_wire_bytes, 256ULL);
+    off += EMBED_TOKENS_BF16_BYTES;
+    if (hdr.flags & 1u) {
+        off = align_up_n(off, 256ULL);
+        off += LM_HEAD_SHADOW_G32_BYTES;
+    }
+    off = align_up_n(off, 256ULL);
+    off += static_cast<uint64_t>(NORM_SCALAR_PARAMS_FP32) * sizeof(float);
+    if (hdr.flags & 2u) {
+        off = align_up_n(off, 256ULL);
+        off += LOOP_CONTROLLER_BF16_BYTES;
+    }
+    return off;
+}
+
 inline ValidationError build_gemma4_descriptor_table(
     uint32_t group_size,
     SlgbHeader& hdr,
     std::array<SiliGemmaLayerDesc, GEMMA4_NUM_LAYERS>& layers,
-    std::vector<SiliGemmaLinearDesc>& linears
+    std::vector<SiliGemmaLinearDesc>& linears,
+    uint32_t flags = 0u
 ) {
     if (group_size != 32u && group_size != 128u) {
         return ValidationError::ERR_BAD_GROUP_SIZE;
+    }
+    if (flags > 3u) {
+        return ValidationError::ERR_BAD_TOPOLOGY;
     }
 
     linears.clear();
@@ -405,7 +456,7 @@ inline ValidationError build_gemma4_descriptor_table(
     uint64_t total_scales_bytes = 0ULL;
     int32_t norm_cursor = 0;
 
-    auto push_linear = [&](uint32_t l_idx, LinearRole role, int32_t m, int32_t k, uint32_t flags) -> int32_t {
+    auto push_linear = [&](uint32_t l_idx, LinearRole role, int32_t m, int32_t k, uint32_t l_flags) -> int32_t {
         const int32_t idx = static_cast<int32_t>(linears.size());
         SiliGemmaLinearDesc d{};
         d.words_byte_offset = total_words_bytes;
@@ -415,7 +466,7 @@ inline ValidationError build_gemma4_descriptor_table(
         d.group_size = static_cast<int32_t>(group_size);
         d.layer_idx = l_idx;
         d.role_id = static_cast<uint32_t>(role);
-        d.flags = flags;
+        d.flags = l_flags;
         total_words_bytes += linear_wire_words_bytes(m, k);
         total_scales_bytes += linear_wire_scales_bytes(m, k, static_cast<int32_t>(group_size));
         total_params += uint64_t(m) * uint64_t(k);
@@ -434,9 +485,9 @@ inline ValidationError build_gemma4_descriptor_table(
         for (int i = 0; i < 9; ++i) ly.linear_idx[i] = -1;
         for (int i = 0; i < 8; ++i) ly.norm_offsets_f32[i] = -1;
 
-        uint32_t flags = 0u;
-        if (l >= HUB_STEER_START_LAYER && l <= HUB_STEER_END_LAYER) flags |= 1u;
-        if (l >= LOOP_START_LAYER && l <= LOOP_END_LAYER) flags |= 2u;
+        uint32_t l_flags = 0u;
+        if (l >= HUB_STEER_START_LAYER && l <= HUB_STEER_END_LAYER) l_flags |= 1u;
+        if (l >= LOOP_START_LAYER && l <= LOOP_END_LAYER) l_flags |= 2u;
 
         const int32_t H = static_cast<int32_t>(GEMMA4_HIDDEN_SIZE);
         const int32_t Q_DIM = static_cast<int32_t>(GEMMA4_NUM_ATTN_HEADS * ly.head_dim);
@@ -444,18 +495,18 @@ inline ValidationError build_gemma4_descriptor_table(
         const int32_t FF = static_cast<int32_t>(ly.intermediate_size);
         const int32_t PLE = static_cast<int32_t>(GEMMA4_PLE_DIM);
 
-        ly.linear_idx[0] = push_linear(l, LinearRole::Q_PROJ, Q_DIM, H, flags);
+        ly.linear_idx[0] = push_linear(l, LinearRole::Q_PROJ, Q_DIM, H, l_flags);
         if (!ly.is_kv_shared) {
-            ly.linear_idx[1] = push_linear(l, LinearRole::K_PROJ, KV_DIM, H, flags);
-            ly.linear_idx[2] = push_linear(l, LinearRole::V_PROJ, KV_DIM, H, flags);
+            ly.linear_idx[1] = push_linear(l, LinearRole::K_PROJ, KV_DIM, H, l_flags);
+            ly.linear_idx[2] = push_linear(l, LinearRole::V_PROJ, KV_DIM, H, l_flags);
         }
         // L15..34 k_proj & v_proj stay -1 (physically absent from wire format!)
-        ly.linear_idx[3] = push_linear(l, LinearRole::O_PROJ, H, Q_DIM, flags);
-        ly.linear_idx[4] = push_linear(l, LinearRole::GATE_PROJ, FF, H, flags);
-        ly.linear_idx[5] = push_linear(l, LinearRole::UP_PROJ, FF, H, flags);
-        ly.linear_idx[6] = push_linear(l, LinearRole::DOWN_PROJ, H, FF, flags);
-        ly.linear_idx[7] = push_linear(l, LinearRole::PLE_GATE, PLE, H, flags);
-        ly.linear_idx[8] = push_linear(l, LinearRole::PLE_PROJ, H, PLE, flags);
+        ly.linear_idx[3] = push_linear(l, LinearRole::O_PROJ, H, Q_DIM, l_flags);
+        ly.linear_idx[4] = push_linear(l, LinearRole::GATE_PROJ, FF, H, l_flags);
+        ly.linear_idx[5] = push_linear(l, LinearRole::UP_PROJ, FF, H, l_flags);
+        ly.linear_idx[6] = push_linear(l, LinearRole::DOWN_PROJ, H, FF, l_flags);
+        ly.linear_idx[7] = push_linear(l, LinearRole::PLE_GATE, PLE, H, l_flags);
+        ly.linear_idx[8] = push_linear(l, LinearRole::PLE_PROJ, H, PLE, l_flags);
 
         // Norm offsets: 5*1536 + q_norm + optional k_norm + scalar
         for (int n = 0; n < 5; ++n) {
@@ -514,8 +565,8 @@ inline ValidationError build_gemma4_descriptor_table(
     hdr.final_logit_softcapping = GEMMA4_FINAL_SOFTCAP;
     hdr.rms_norm_eps = GEMMA4_RMS_NORM_EPS;
     hdr.total_wire_bytes = wire_bytes;
-    hdr.flags = 0u;
-    hdr.header_crc32 = 0u;
+    hdr.flags = flags;
+    hdr.header_crc32 = compute_slgb_header_crc32(hdr);
     return ValidationError::OK;
 }
 
@@ -531,9 +582,18 @@ inline ValidationError validate_runtime_contract(
     if (hdr.bos_token_id != GEMMA4_BOS_TOKEN_ID) return ValidationError::ERR_BOS_NOT_2;
     if (tokens == nullptr || n_tokens == 0u) return ValidationError::ERR_EMPTY_TOKENS;
     if (tokens[0] != GEMMA4_BOS_TOKEN_ID) return ValidationError::ERR_BOS_NOT_2;
+    for (size_t i = 0u; i < n_tokens; ++i) {
+        if (tokens[i] >= hdr.vocab_size) return ValidationError::ERR_BAD_TOKEN_ID;
+    }
     if (hdr.hidden_size != GEMMA4_HIDDEN_SIZE || hdr.num_layers != GEMMA4_NUM_LAYERS ||
-        hdr.num_kv_shared_layers != GEMMA4_NUM_KV_SHARED || hdr.vocab_size != GEMMA4_VOCAB_SIZE) {
+        hdr.num_kv_shared_layers != GEMMA4_NUM_KV_SHARED || hdr.vocab_size != GEMMA4_VOCAB_SIZE ||
+        hdr.eos_token_ids[0] != GEMMA4_EOS_TOKEN_ID_0 || hdr.eos_token_ids[1] != GEMMA4_EOS_TOKEN_ID_1 ||
+        hdr.pad_token_id != GEMMA4_PAD_TOKEN_ID || hdr.final_logit_softcapping != GEMMA4_FINAL_SOFTCAP ||
+        hdr.rms_norm_eps != GEMMA4_RMS_NORM_EPS || hdr.flags > 3u) {
         return ValidationError::ERR_BAD_TOPOLOGY;
+    }
+    if (hdr.header_crc32 != 0u && hdr.header_crc32 != compute_slgb_header_crc32(hdr)) {
+        return ValidationError::ERR_BAD_CRC32;
     }
     if (hdr.group_size != 32u && hdr.group_size != 128u) return ValidationError::ERR_BAD_GROUP_SIZE;
     if (hdr.num_live_linears != LIVE_LINEAR_COUNT || linears.size() != LIVE_LINEAR_COUNT ||
@@ -562,9 +622,40 @@ inline ValidationError validate_runtime_contract(
         }
     }
     for (const auto& d : linears) {
-        if (d.in_dim <= 0 || d.out_dim <= 0 || (d.in_dim % 128) != 0 || (d.out_dim % 16) != 0) {
+        if (d.in_dim <= 0 || d.out_dim <= 0 || (d.in_dim % 128) != 0 || (d.out_dim % 16) != 0 ||
+            d.group_size != static_cast<int32_t>(hdr.group_size)) {
             return ValidationError::ERR_BAD_DIMS;
         }
+    }
+    return ValidationError::OK;
+}
+
+inline ValidationError validate_slgb_file_layout(
+    const SlgbHeader& hdr,
+    const std::array<SiliGemmaLayerDesc, GEMMA4_NUM_LAYERS>& layers,
+    const std::vector<SiliGemmaLinearDesc>& linears,
+    uint64_t actual_file_size,
+    bool require_crc32 = true
+) {
+    const uint32_t dummy_tok[1] = {GEMMA4_BOS_TOKEN_ID};
+    const ValidationError base_err = validate_runtime_contract(hdr, layers, linears, dummy_tok, 1u);
+    if (base_err != ValidationError::OK) return base_err;
+    if (require_crc32 && hdr.header_crc32 == 0u) return ValidationError::ERR_BAD_CRC32;
+    if (hdr.header_crc32 != compute_slgb_header_crc32(hdr)) return ValidationError::ERR_BAD_CRC32;
+    if (actual_file_size != expected_slgb_file_bytes(hdr)) return ValidationError::ERR_BAD_FILE_SIZE;
+
+    SlgbHeader exp_hdr{};
+    std::array<SiliGemmaLayerDesc, GEMMA4_NUM_LAYERS> exp_layers{};
+    std::vector<SiliGemmaLinearDesc> exp_linears;
+    const ValidationError build_err = build_gemma4_descriptor_table(
+        static_cast<uint32_t>(hdr.group_size), exp_hdr, exp_layers, exp_linears, hdr.flags
+    );
+    if (build_err != ValidationError::OK) return build_err;
+    if (std::memcmp(&hdr, &exp_hdr, sizeof(SlgbHeader)) != 0) return ValidationError::ERR_BAD_TOPOLOGY;
+    if (std::memcmp(layers.data(), exp_layers.data(), sizeof(exp_layers)) != 0) return ValidationError::ERR_BAD_TOPOLOGY;
+    if (linears.size() != exp_linears.size() ||
+        std::memcmp(linears.data(), exp_linears.data(), exp_linears.size() * sizeof(SiliGemmaLinearDesc)) != 0) {
+        return ValidationError::ERR_BAD_WIRE_BYTES;
     }
     return ValidationError::OK;
 }
@@ -594,17 +685,29 @@ inline float tree_reduce_128_cpu(std::array<float, 128>& tile) noexcept {
 inline float canonical_tree_sum_block128_f32(const float* data, size_t n) {
     if (n == 0u || data == nullptr) return 0.0f;
     const size_t n_blocks = (n + 127u) / 128u;
-    std::array<float, 128> outer{};
-    outer.fill(0.0f);
+    if (n_blocks <= 128u) {
+        std::array<float, 128> outer{};
+        outer.fill(0.0f);
+        std::array<float, 128> tile{};
+        for (size_t b = 0u; b < n_blocks; ++b) {
+            tile.fill(0.0f);
+            const size_t base = b * 128u;
+            const size_t lim = (base + 128u <= n) ? 128u : (n - base);
+            for (size_t t = 0u; t < lim; ++t) tile[t] = data[base + t];
+            outer[b] = tree_reduce_128_cpu(tile);
+        }
+        return tree_reduce_128_cpu(outer);
+    }
+    std::vector<float> outer_vec(n_blocks, 0.0f);
     std::array<float, 128> tile{};
     for (size_t b = 0u; b < n_blocks; ++b) {
         tile.fill(0.0f);
         const size_t base = b * 128u;
         const size_t lim = (base + 128u <= n) ? 128u : (n - base);
         for (size_t t = 0u; t < lim; ++t) tile[t] = data[base + t];
-        outer[b] = tree_reduce_128_cpu(tile);
+        outer_vec[b] = tree_reduce_128_cpu(tile);
     }
-    return tree_reduce_128_cpu(outer);
+    return canonical_tree_sum_block128_f32(outer_vec.data(), n_blocks);
 }
 
 inline float canonical_tree_sum_f32(const float* data, size_t n) {
@@ -740,9 +843,10 @@ inline ValidationError evaluate_riccati_loop_guard(
     double& out_rho_hat,
     float& out_step_ratio,
     float& out_cos
-) noexcept {
+) {
     if (pass_idx < 1u || pass_idx > MAX_LOOP_PASSES) return ValidationError::ERR_LOOP_K_INVALID;
     if (prev_exit == nullptr || cur_exit == nullptr || dim == 0u) return ValidationError::ERR_BAD_DIMS;
+    if (pass_idx >= 3u && prev_delta == nullptr) return ValidationError::ERR_BAD_DIMS;
 
     std::vector<float> sq_prev(dim, 0.0f), sq_cur(dim, 0.0f), sq_diff(dim, 0.0f), dot_pc(dim, 0.0f);
     std::vector<float> sq_pdelta(dim, 0.0f);
@@ -767,14 +871,12 @@ inline ValidationError evaluate_riccati_loop_guard(
     out_rho_hat = 0.0;
     if (prev_delta != nullptr) {
         const float n_pd = std::sqrt(canonical_tree_sum_block128_f32(sq_pdelta.data(), dim));
-        if (n_pd > 1.0e-12f) {
-            out_rho_hat = static_cast<double>(n_diff) / static_cast<double>(n_pd);
+        out_rho_hat = (n_pd > 1.0e-12f) ? (static_cast<double>(n_diff) / static_cast<double>(n_pd)) : (0.0 / 0.0);
+        if (!std::isfinite(out_rho_hat) || out_rho_hat >= RICCATI_RHO_LIMIT) {
+            return ValidationError::ERR_RICCATI_RHO_GE_LIMIT;
         }
     }
 
-    if (!std::isfinite(out_rho_hat) || out_rho_hat >= RICCATI_RHO_LIMIT) {
-        return ValidationError::ERR_RICCATI_RHO_GE_LIMIT;
-    }
     if (!std::isfinite(out_step_ratio) || out_step_ratio >= S164_STEP_RATIO_LIMIT || out_cos < LOOP_EXIT_COS_MIN) {
         return ValidationError::ERR_S164_STEP_DIVERGENCE;
     }

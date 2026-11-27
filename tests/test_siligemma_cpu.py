@@ -25,6 +25,7 @@ import sys
 import tempfile
 import unittest
 from typing import Any, Sequence
+import zlib
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 sys.dont_write_bytecode = True
@@ -40,11 +41,16 @@ if str(TOOLS_DIR) not in sys.path:
 import pack_siligemma_formb as packer  # noqa: E402
 
 EXPECTED_PINNED_SHA256 = {
+    "Makefile": "02e03b0adb77c744d6c9c8d1771ff2b4777b638fd5a731d507fbd917cb20ca9f",
     "docs/ARCHITECTURE_FORMB_SILIGEMMA.md": "b7410d0c491748632585f884115d8241efe0b837290ce164e78fe41a0b074fd6",
     "docs/PREREG_W22_GEMMA4_FORMB.json": "03724afa55d9008675225ae48cf78bc2fdcd180418ec6a5ad60a4e15facf37e0",
     "docs/STAGE1_REPORT.md": "86f95ebae659922693853c030723d120996dd8d56de82cb875c922076023af99",
     "docs/STAGE1_VERDICT.json": "d67403ae29265313d163e93ea0184ef5eb9c17e4a5786c89bff186540df4c97b",
+    "kernels/siligemma_arena.hpp": "03515456d218fb2e5efb39f777fffd20d1435df173f70e2222bf08257d619c16",
+    "kernels/siligemma_bench_sm86.cu": "485186a74800c30cb9812c51086e764290aed7eccb2b875bfbbb68edfb671ec8",
     "kernels/siligemma_kernels_sm86.cu": "5ee2e547bcacc0b14659160645c0044b32accf10e0c4326db97f55d440413818",
+    "tools/pack_siligemma_formb.py": "b0a9a73b15477140ee83045ec0bacf509524c7d51b97c054d0d2759702ef16ee",
+    "tools/slgb_cpu_worker.cpp": "2b0c4579680de3526635bba85bda93523274e66aec0a8175410ba3848f7d28f3",
 }
 
 MAX_KERNEL_REGS = 48
@@ -149,8 +155,7 @@ def canonical_tree_sum_block128_py(vals: Sequence[float]) -> float:
     if n == 0:
         return f32(0.0)
     n_blocks = (n + 127) // 128
-    require_ok(n_blocks <= 128, "TREE_MAX_BLOCKS", f"too many blocks: {n_blocks}")
-    outer = [f32(0.0)] * 128
+    outer = [f32(0.0)] * (128 if n_blocks <= 128 else n_blocks)
     for b in range(n_blocks):
         tile = [f32(0.0)] * 128
         base = b * 128
@@ -158,7 +163,9 @@ def canonical_tree_sum_block128_py(vals: Sequence[float]) -> float:
         for t in range(lim):
             tile[t] = f32(vals[base + t])
         outer[b] = tree_reduce_128_py(tile)
-    return tree_reduce_128_py(outer)
+    if n_blocks <= 128:
+        return tree_reduce_128_py(outer)
+    return canonical_tree_sum_block128_py(outer)
 
 
 def canonical_tree_rmsnorm_py(x: Sequence[float], gamma: Sequence[float] | None = None, eps: float = 1.0e-6) -> list[float]:
@@ -185,6 +192,28 @@ def a16_secded_syndrome_py(w64: int) -> int:
     s2 = (px & 0x11110000).bit_count() & 1
     s3 = (w1 & 0x11111111).bit_count() & 1
     return p0 | (s0 << 1) | (s1 << 2) | (s2 << 3) | (s3 << 4)
+
+
+def parse_ptxas_log(text: str) -> dict[str, dict[str, int]]:
+    out: dict[str, dict[str, int]] = {}
+    cur_name: str | None = None
+    for ln in text.splitlines():
+        m_fn = re.search(r"Function properties for (\S+)", ln)
+        if m_fn:
+            cur_name = m_fn.group(1)
+            out[cur_name] = {"stack_bytes": 0, "spill_store_bytes": 0, "spill_load_bytes": 0, "registers": 0}
+            continue
+        if cur_name is None:
+            continue
+        m_sp = re.search(r"(\d+)\s+bytes stack frame,\s*(\d+)\s+bytes spill stores,\s*(\d+)\s+bytes spill loads", ln)
+        if m_sp:
+            out[cur_name]["stack_bytes"] = int(m_sp.group(1))
+            out[cur_name]["spill_store_bytes"] = int(m_sp.group(2))
+            out[cur_name]["spill_load_bytes"] = int(m_sp.group(3))
+        m_rg = re.search(r"Used\s+(\d+)\s+registers", ln)
+        if m_rg:
+            out[cur_name]["registers"] = int(m_rg.group(1))
+    return out
 
 
 def validate_ptxas_and_sass(
@@ -323,6 +352,22 @@ int main() {{
     const uint32_t bad_bos[2] = {{1u, 42u}};
     if (siligemma::validate_runtime_contract(hdr32, layers32, lin32, bad_bos, 2u) != siligemma::ValidationError::ERR_BOS_NOT_2) return 5;
     if (siligemma::validate_runtime_contract(hdr32, layers32, lin32, nullptr, 0u) != siligemma::ValidationError::ERR_EMPTY_TOKENS) return 6;
+    const uint32_t oob_toks[2] = {{2u, 262144u}};
+    if (siligemma::validate_runtime_contract(hdr32, layers32, lin32, oob_toks, 2u) != siligemma::ValidationError::ERR_BAD_TOKEN_ID) return 15;
+
+    siligemma::SlgbHeader hdr32_f3{{}};
+    std::array<siligemma::SiliGemmaLayerDesc, siligemma::GEMMA4_NUM_LAYERS> layers32_f3{{}};
+    std::vector<siligemma::SiliGemmaLinearDesc> lin32_f3;
+    if (siligemma::build_gemma4_descriptor_table(32u, hdr32_f3, layers32_f3, lin32_f3, 3u) != siligemma::ValidationError::OK) return 16;
+    const uint64_t exp_sz = siligemma::expected_slgb_file_bytes(hdr32_f3);
+    if (siligemma::validate_slgb_file_layout(hdr32_f3, layers32_f3, lin32_f3, exp_sz, true) != siligemma::ValidationError::OK) return 17;
+    auto bad_crc_hdr = hdr32_f3;
+    bad_crc_hdr.header_crc32 ^= 0x1u;
+    if (siligemma::validate_slgb_file_layout(bad_crc_hdr, layers32_f3, lin32_f3, exp_sz, true) != siligemma::ValidationError::ERR_BAD_CRC32) return 18;
+    if (siligemma::validate_slgb_file_layout(hdr32_f3, layers32_f3, lin32_f3, exp_sz - 16ULL, true) != siligemma::ValidationError::ERR_BAD_FILE_SIZE) return 19;
+    auto bad_lin = lin32_f3;
+    bad_lin[7].words_byte_offset += 64ULL;
+    if (siligemma::validate_slgb_file_layout(hdr32_f3, layers32_f3, bad_lin, exp_sz, true) != siligemma::ValidationError::ERR_BAD_WIRE_BYTES) return 20;
 
     for (uint32_t l = 15u; l < 35u; ++l) {{
         auto bad_ly = layers32;
@@ -347,6 +392,9 @@ int main() {{
     const float vec[1536] = {{ {vec_lit} }};
     const float gam[1536] = {{ {gam_lit} }};
     const float tree_sum = siligemma::canonical_tree_sum_block128_f32(vec, 1536u);
+    std::vector<float> big20k(20000u, 0.0f);
+    for (size_t i = 0u; i < 20000u; ++i) big20k[i] = vec[i % 1536u] * 0.25f;
+    const float sum_20k = siligemma::canonical_tree_sum_block128_f32(big20k.data(), big20k.size());
     std::vector<float> rms_out(1536u, 0.0f);
     siligemma::canonical_tree_rmsnorm_f32(vec, gam, rms_out.data(), 1536u);
 
@@ -361,12 +409,14 @@ int main() {{
     if (siligemma::evaluate_riccati_loop_guard(prev_h.data(), cur_h.data(), prev_d.data(), D, 2u, rho_ok, sr_ok, cos_ok) != siligemma::ValidationError::OK) return 12;
     if (siligemma::evaluate_riccati_loop_guard(prev_h.data(), bad_h.data(), prev_d.data(), D, 2u, rho_bad, sr_bad, cos_bad) != siligemma::ValidationError::ERR_RICCATI_RHO_GE_LIMIT) return 13;
     if (siligemma::evaluate_riccati_loop_guard(prev_h.data(), cur_h.data(), prev_d.data(), D, 4u, rho_ok, sr_ok, cos_ok) != siligemma::ValidationError::ERR_LOOP_K_INVALID) return 14;
+    if (siligemma::evaluate_riccati_loop_guard(prev_h.data(), cur_h.data(), nullptr, D, 3u, rho_ok, sr_ok, cos_ok) != siligemma::ValidationError::ERR_BAD_DIMS) return 21;
 
     std::printf(
-        "{{\\"tree_sum_bits\\": \\"0x%08x\\", \\"rms0_bits\\": \\"0x%08x\\", \\"rms1535_bits\\": \\"0x%08x\\", "
+        "{{\\"tree_sum_bits\\": \\"0x%08x\\", \\"sum_20k_bits\\": \\"0x%08x\\", \\"rms0_bits\\": \\"0x%08x\\", \\"rms1535_bits\\": \\"0x%08x\\", "
         "\\"wire_g32\\": %llu, \\"wire_g128\\": %llu, \\"arena_16k\\": %llu, \\"arena_64k_shadow\\": %llu, "
-        "\\"arena_128k\\": %llu, \\"rho_ok\\": %.6f, \\"rho_bad\\": %.6f, \\"all_cpp_r5_passed\\": true}}\\n",
+        "\\"arena_128k\\": %llu, \\"slgb_exp_sz\\": %llu, \\"rho_ok\\": %.6f, \\"rho_bad\\": %.6f, \\"all_cpp_r5_passed\\": true}}\\n",
         siligemma::float_bits_u32(tree_sum),
+        siligemma::float_bits_u32(sum_20k),
         siligemma::float_bits_u32(rms_out[0]),
         siligemma::float_bits_u32(rms_out[1535]),
         static_cast<unsigned long long>(hdr32.total_wire_bytes),
@@ -374,6 +424,7 @@ int main() {{
         static_cast<unsigned long long>(siligemma::kArena16K.total_arena_bytes),
         static_cast<unsigned long long>(siligemma::kArena64KShadow.total_arena_bytes),
         static_cast<unsigned long long>(siligemma::kArena128K.total_arena_bytes),
+        static_cast<unsigned long long>(exp_sz),
         rho_ok,
         rho_bad
     );
@@ -424,6 +475,7 @@ class TestSiliGemmaCPU(unittest.TestCase):
         vec = [f32(rng.gauss(0.0, 1.25)) for _ in range(1536)]
         gam = [f32(rng.uniform(0.75, 1.25)) for _ in range(1536)]
         py_sum = canonical_tree_sum_block128_py(vec)
+        py_sum_20k = canonical_tree_sum_block128_py([f32(vec[i % 1536] * 0.25) for i in range(20000)])
         py_rms = canonical_tree_rmsnorm_py(vec, gam, eps=1.0e-6)
         cpp_src = _build_cpp_parity_source(vec, gam)
 
@@ -451,6 +503,8 @@ class TestSiliGemmaCPU(unittest.TestCase):
         self.assertLess(res["rho_ok"], 0.618)
         self.assertGreaterEqual(res["rho_bad"], 0.618)
         self.assertEqual(res["tree_sum_bits"], f"0x{f32_bits(py_sum):08x}")
+        self.assertEqual(res["sum_20k_bits"], f"0x{f32_bits(py_sum_20k):08x}")
+        self.assertEqual(res["slgb_exp_sz"], 2094062080)
         self.assertEqual(res["rms0_bits"], f"0x{f32_bits(py_rms[0]):08x}")
         self.assertEqual(res["rms1535_bits"], f"0x{f32_bits(py_rms[1535]):08x}")
 
@@ -462,6 +516,28 @@ class TestSiliGemmaCPU(unittest.TestCase):
         self.assertEqual(sec["total_file_bytes"], 2094062080)
         hdr = packer.pack_slgb_header_and_descs(geom, flags=3)
         self.assertEqual(len(hdr), 64 + 35 * 92 + 276 * 48)
+        exp_crc = zlib.crc32(hdr[:60] + b"\x00\x00\x00\x00") & 0xFFFFFFFF
+        got_crc = struct.unpack("<I", hdr[60:64])[0]
+        self.assertEqual(got_crc, exp_crc)
+        self.assertNotEqual(got_crc, 0)
+
+        # Negative control: norm tensor shape/span mismatch must fail validation
+        fake_hdr: dict[str, Any] = {}
+        for d in geom["linears"]:
+            fake_hdr[f"model.language_model.{d['name']}.weight"] = {
+                "dtype": "BF16", "shape": [d["out_dim"], d["in_dim"]], "data_offsets": [0, d["out_dim"] * d["in_dim"] * 2]
+            }
+        fake_hdr["model.language_model.embed_tokens.weight"] = {
+            "dtype": "BF16", "shape": [packer.GEMMA4_VOCAB, packer.GEMMA4_HIDDEN], "data_offsets": [0, packer.EMBED_BF16_BYTES]
+        }
+        for ns in geom["norm_specs"]:
+            fake_hdr[f"model.language_model.{ns['key']}"] = {
+                "dtype": "BF16", "shape": [ns["count"]], "data_offsets": [0, ns["count"] * 2]
+            }
+        packer.validate_safetensors_tensor_spans(fake_hdr, geom)
+        fake_hdr["model.language_model.norm.weight"]["shape"] = [999]
+        with self.assertRaises(ValueError):
+            packer.validate_safetensors_tensor_spans(fake_hdr, geom)
 
         verdict = parse_strict_json_bytes(read_regular_bytes_nofollow(DOCS_DIR / "STAGE1_VERDICT.json"), label="verdict")
         recomp = _recompute_s184_kill_gates(verdict["raw_measurements"])
@@ -509,18 +585,21 @@ class TestSiliGemmaCPU(unittest.TestCase):
             self.assertNotEqual(v_bad.returncode, 0)
 
     def test_05_r5_ptxas_and_sass_must_fail_controls(self) -> None:
-        good_k = {
-            f"k{i}": {"stack_bytes": 0, "spill_store_bytes": 0, "spill_load_bytes": 0, "registers": 48 if i == 0 else 32, "smem_bytes": 1664}
+        sample_ptxas = "\n".join(
+            f"ptxas info    : Function properties for k{i}\n"
+            "    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads\n"
+            f"ptxas info    : Used {48 if i == 0 else 32} registers, used 1 barriers, 1664 bytes smem"
             for i in range(20)
-        }
-        ok = validate_ptxas_and_sass(good_k, {"ldl_insns": 0, "stl_insns": 0}, min_kernels=13)
+        )
+        parsed = parse_ptxas_log(sample_ptxas)
+        ok = validate_ptxas_and_sass(parsed, {"ldl_insns": 0, "stl_insns": 0}, min_kernels=13)
         self.assertEqual(ok["total_kernels"], 20)
-        bad_reg = {k: dict(v) for k, v in good_k.items()}
-        bad_reg["k0"]["registers"] = 49
+        self.assertEqual(ok["max_registers"], 48)
+        bad_reg = parse_ptxas_log(sample_ptxas.replace("Used 48 registers", "Used 49 registers"))
         with self.assertRaises(SiliGemmaGateError):
             validate_ptxas_and_sass(bad_reg, {"ldl_insns": 0, "stl_insns": 0}, min_kernels=13)
         with self.assertRaises(SiliGemmaGateError):
-            validate_ptxas_and_sass(good_k, {"ldl_insns": 1, "stl_insns": 0}, min_kernels=13)
+            validate_ptxas_and_sass(parsed, {"ldl_insns": 1, "stl_insns": 0}, min_kernels=13)
 
 
 def main() -> int:

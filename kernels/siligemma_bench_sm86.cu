@@ -272,7 +272,12 @@ static SlgbLoadedMeta parse_slgb_meta(int fd) {
 
     struct stat st{};
     SG_REQUIRE(::fstat(fd, &st) == 0, "fstat slgb failed");
-    SG_REQUIRE(static_cast<uint64_t>(st.st_size) >= off, "slgb file truncated");
+    const uint64_t fsz = static_cast<uint64_t>(st.st_size);
+    SG_REQUIRE(
+        siligemma::validate_slgb_file_layout(m.hdr, m.layers, m.linears, fsz, true) == siligemma::ValidationError::OK,
+        "SLGB header/descriptor/CRC32/size contract validation failed"
+    );
+    SG_REQUIRE(fsz == off, "slgb file size mismatch vs section offsets");
     return m;
 }
 
@@ -844,8 +849,12 @@ static CapturedGraph capture_full_step_graph(
         }
     }
 
+    SG_REQUIRE(!keep_unnormalized_logits, "Captured bench graph computes softcapped LM-head logits only");
+    siligemma_sm86::siligemma_iris_canary_finalize_sm86<<<1, 128, 0, stream_compute>>>(
+        cur_h, p.dev_canary, 34u, static_cast<uint32_t>(loop_k), 0u, 0, H
+    );
     siligemma_sm86::siligemma_softcap_logits_argmax_sm86<<<batch_size, 128, 0, stream_compute>>>(
-        p.d_logits, keep_unnormalized_logits ? nullptr : nullptr,
+        p.d_logits, nullptr,
         p.d_tok_out, p.d_argmax_score, use_d_pos ? p.d_pos_i32 : nullptr, -1.0f, V
     );
 
@@ -942,7 +951,7 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
         SG_CUDA_OK(cudaHostGetDevicePointer(&dev_canary, host_canary, 0));
         std::memset(host_canary, 0, sizeof(*host_canary));
 
-        // Load PLE table (4.375 GiB) into pinned host RAM (fallback to pageable if memlock denies)
+        // Load PLE table (4.375 GiB) into pinned host RAM after verifying safetensors header entry & byte span
         bool ple_pinned_ok = true;
         __nv_bfloat16* h_ple_table = nullptr;
         if (cudaHostAlloc(&h_ple_table, siligemma::PLE_HOST_PINNED_BYTES, cudaHostAllocDefault) != cudaSuccess) {
@@ -953,7 +962,31 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
         {
             int ple_fd = ::open(args.ple_safetensors.c_str(), O_RDONLY);
             SG_REQUIRE(ple_fd >= 0, "Failed to open PLE safetensors");
-            pread_exact(ple_fd, h_ple_table, siligemma::PLE_HOST_PINNED_BYTES, args.ple_offset);
+            uint64_t hdr_len = 0ULL;
+            pread_exact(ple_fd, &hdr_len, sizeof(hdr_len), 0ULL);
+            SG_REQUIRE(hdr_len > 0ULL && hdr_len <= 64ULL * 1024ULL * 1024ULL, "Invalid safetensors header length");
+            std::string hdr_json(static_cast<size_t>(hdr_len), '\0');
+            pread_exact(ple_fd, hdr_json.data(), static_cast<size_t>(hdr_len), sizeof(hdr_len));
+            const size_t kpos = hdr_json.find("\"model.language_model.embed_tokens_per_layer.weight\"");
+            SG_REQUIRE(kpos != std::string::npos, "PLE tensor missing from safetensors header");
+            const size_t obj_end = hdr_json.find('}', kpos);
+            SG_REQUIRE(obj_end != std::string::npos, "Malformed PLE safetensors header object");
+            const std::string entry = hdr_json.substr(kpos, obj_end - kpos + 1u);
+            SG_REQUIRE(entry.find("\"BF16\"") != std::string::npos, "PLE tensor dtype must be BF16");
+            SG_REQUIRE(entry.find("[262144,8960]") != std::string::npos || entry.find("[262144, 8960]") != std::string::npos,
+                       "PLE tensor shape must be [262144, 8960]");
+            const size_t dop = entry.find("\"data_offsets\"");
+            SG_REQUIRE(dop != std::string::npos, "PLE tensor missing data_offsets");
+            const size_t lb = entry.find('[', dop);
+            const size_t cm = (lb != std::string::npos) ? entry.find(',', lb) : std::string::npos;
+            const size_t rb = (cm != std::string::npos) ? entry.find(']', cm) : std::string::npos;
+            SG_REQUIRE(lb != std::string::npos && cm != std::string::npos && rb != std::string::npos, "Malformed PLE data_offsets");
+            const uint64_t rel_s = std::strtoull(entry.c_str() + lb + 1u, nullptr, 10);
+            const uint64_t rel_e = std::strtoull(entry.c_str() + cm + 1u, nullptr, 10);
+            SG_REQUIRE(rel_e > rel_s && (rel_e - rel_s) == siligemma::PLE_HOST_PINNED_BYTES, "PLE byte span mismatch");
+            const uint64_t verified_abs_off = 8ULL + hdr_len + rel_s;
+            SG_REQUIRE(verified_abs_off == args.ple_offset, "--ple-offset mismatches safetensors embed_tokens_per_layer.weight offset");
+            pread_exact(ple_fd, h_ple_table, siligemma::PLE_HOST_PINNED_BYTES, verified_abs_off);
             ::close(ple_fd);
         }
 
@@ -1279,6 +1312,7 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
                 h_ple_pin, ptrs.d_ple_stage_0, false, 0.0f, true,
                 stream_compute, stream_dma, ev_fork, ev_dma_done
             );
+            SG_REQUIRE(prompt_tokens.size() <= static_cast<size_t>(AL.t_max), "prompt_tokens exceeds arena t_max capacity");
             for (size_t t = 0u; t < prompt_tokens.size(); ++t) {
                 const int32_t tok = static_cast<int32_t>(prompt_tokens[t]);
                 const int32_t pos_val = static_cast<int32_t>(t);
@@ -1291,6 +1325,10 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
                 SG_CUDA_OK(cudaMemcpyAsync(ptrs.d_pos_i32, &pos_val, sizeof(int32_t), cudaMemcpyHostToDevice, stream_compute));
                 SG_CUDA_OK(cudaGraphLaunch(g_prompt.exec, stream_compute));
                 SG_CUDA_OK(cudaStreamSynchronize(stream_compute));
+                SG_REQUIRE(
+                    siligemma::evaluate_canary_watchdog(*host_canary, 0u, false) == siligemma::WatchdogAction::CONTINUE,
+                    "Watchdog SAFE_HALT_DED_ROLLBACK triggered during prompt decode before output commit"
+                );
             }
             std::vector<float> logits_out(siligemma::GEMMA4_VOCAB_SIZE);
             SG_CUDA_OK(cudaMemcpy(logits_out.data(), ptrs.d_logits, logits_out.size() * sizeof(float), cudaMemcpyDeviceToHost));
@@ -1314,8 +1352,12 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
             for (int r = 0; r < 16; ++r) {
                 SG_REQUIRE(wt2_flat[r * 256] == 2u, "WT2 sequence missing bos=2");
             }
+            for (const uint32_t tk : wt2_flat) {
+                SG_REQUIRE(tk < siligemma::GEMMA4_VOCAB_SIZE, "WT2 token id >= vocab_size");
+            }
             auto eval_wt2_cuda = [&](int k_pass, bool use_4p5) -> double {
                 SG_CUDA_OK(cudaMemset(ptrs.d_kv_base, 0, AL.sz_p5_zed_kv_ring));
+                std::memset(host_canary, 0, sizeof(*host_canary));
                 CapturedGraph g_w = capture_full_step_graph(
                     ptrs, m, h_norms, 16, k_pass, use_4p5, 0, true, true,
                     h_ple_pin, ptrs.d_ple_stage_0, false, 0.0f, true,
@@ -1326,6 +1368,7 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
                 std::vector<uint32_t> next_tgts(16);
                 double nll_sum = 0.0;
                 uint64_t tok_cnt = 0ULL;
+                SG_REQUIRE(255u < AL.t_max, "WT2 sequence exceeds arena t_max capacity");
                 for (int t = 0; t < 255; ++t) {
                     for (int r = 0; r < 16; ++r) {
                         const uint32_t tk = wt2_flat[r * 256 + t];
@@ -1343,6 +1386,10 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
                     SG_CUDA_OK(cudaGraphLaunch(g_w.exec, stream_compute));
                     SG_CUDA_OK(cudaMemcpyAsync(h_logits.data(), ptrs.d_logits, h_logits.size() * sizeof(float), cudaMemcpyDeviceToHost, stream_compute));
                     SG_CUDA_OK(cudaStreamSynchronize(stream_compute));
+                    SG_REQUIRE(
+                        siligemma::evaluate_canary_watchdog(*host_canary, 0u, false) == siligemma::WatchdogAction::CONTINUE,
+                        "Watchdog SAFE_HALT_DED_ROLLBACK triggered during WT2 eval"
+                    );
                     compute_batch_nll_cpu(h_logits.data(), next_tgts.data(), 16, static_cast<int>(siligemma::GEMMA4_VOCAB_SIZE), nll_sum, tok_cnt);
                 }
                 g_w.destroy();

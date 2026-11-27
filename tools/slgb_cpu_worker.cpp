@@ -62,6 +62,9 @@ static inline float bf16_to_f32(uint16_t b) noexcept {
 static inline uint16_t f32_to_bf16_rne(float f) noexcept {
     uint32_t u = 0u;
     std::memcpy(&u, &f, sizeof(u));
+    if ((u & 0x7FFFFFFFu) > 0x7F800000u) {
+        return static_cast<uint16_t>((u >> 16) | 0x0040u);
+    }
     uint32_t lsb = (u >> 16) & 1u;
     uint32_t rounding_bias = 0x7FFFu + lsb;
     u += rounding_bias;
@@ -314,11 +317,16 @@ static int cmd_pack(const char* st_path, const char* slgb_path, const char* jobs
 
     int fd_in = ::open(st_path, O_RDONLY);
     if (fd_in < 0) { std::perror("open input safetensors"); return 1; }
-    int fd_out = ::open(slgb_path, O_RDWR);
-    if (fd_out < 0) { std::perror("open output slgb"); return 1; }
+    int fd_out = ::open(slgb_path, O_RDWR | O_CREAT, 0644);
+    if (fd_out < 0) { std::perror("open output slgb"); ::close(fd_in); return 1; }
 
     std::ifstream jf(jobs_path);
-    if (!jf) { std::fprintf(stderr, "Cannot open jobs file: %s\n", jobs_path); return 1; }
+    if (!jf) {
+        std::fprintf(stderr, "Cannot open jobs file: %s\n", jobs_path);
+        ::close(fd_in);
+        ::close(fd_out);
+        return 1;
+    }
 
     std::string line;
     std::vector<uint16_t> bf16_buf;
@@ -332,11 +340,14 @@ static int cmd_pack(const char* st_path, const char* slgb_path, const char* jobs
         if (line.empty()) continue;
         std::istringstream iss(line);
         std::string kind;
-        iss >> kind;
+        if (!(iss >> kind)) continue;
         if (kind == "LINEAR") {
             int m = 0, k = 0;
             uint64_t in_off = 0, out_w_off = 0, out_s_off = 0;
-            iss >> m >> k >> in_off >> out_w_off >> out_s_off;
+            if (!(iss >> m >> k >> in_off >> out_w_off >> out_s_off) || m <= 0 || k <= 0 || (k % 32) != 0) {
+                std::fprintf(stderr, "Malformed LINEAR job line\n");
+                return 1;
+            }
             const size_t n_elems = static_cast<size_t>(m) * static_cast<size_t>(k);
             bf16_buf.resize(n_elems);
             pread_exact(fd_in, bf16_buf.data(), n_elems * sizeof(uint16_t), in_off);
@@ -349,7 +360,11 @@ static int cmd_pack(const char* st_path, const char* slgb_path, const char* jobs
         } else if (kind == "EMBED") {
             int total_rows = 0, k = 0, chunk_rows = 0;
             uint64_t in_off = 0, out_emb_off = 0, out_w_off = 0, out_s_off = 0;
-            iss >> total_rows >> k >> chunk_rows >> in_off >> out_emb_off >> out_w_off >> out_s_off;
+            if (!(iss >> total_rows >> k >> chunk_rows >> in_off >> out_emb_off >> out_w_off >> out_s_off) ||
+                total_rows <= 0 || k <= 0 || chunk_rows <= 0 || (k % 32) != 0) {
+                std::fprintf(stderr, "Malformed EMBED job line\n");
+                return 1;
+            }
             for (int r0 = 0; r0 < total_rows; r0 += chunk_rows) {
                 int r_cnt = std::min(chunk_rows, total_rows - r0);
                 size_t n_elems = static_cast<size_t>(r_cnt) * static_cast<size_t>(k);
@@ -370,7 +385,10 @@ static int cmd_pack(const char* st_path, const char* slgb_path, const char* jobs
         } else if (kind == "NORM") {
             size_t cnt = 0;
             uint64_t in_off = 0, out_off = 0;
-            iss >> cnt >> in_off >> out_off;
+            if (!(iss >> cnt >> in_off >> out_off) || cnt == 0u) {
+                std::fprintf(stderr, "Malformed NORM job line\n");
+                return 1;
+            }
             bf16_buf.resize(cnt);
             f32_buf.resize(cnt);
             pread_exact(fd_in, bf16_buf.data(), cnt * sizeof(uint16_t), in_off);
@@ -393,17 +411,28 @@ static int cmd_pack(const char* st_path, const char* slgb_path, const char* jobs
 static int cmd_verify(const char* slgb_path) {
     int fd = ::open(slgb_path, O_RDONLY);
     if (fd < 0) { std::perror("open slgb"); return 1; }
+    struct stat st{};
+    if (::fstat(fd, &st) != 0 || st.st_size < static_cast<off_t>(sizeof(siligemma::SlgbHeader))) {
+        std::fprintf(stderr, "slgb file missing or truncated\n");
+        ::close(fd);
+        return 1;
+    }
+    const uint64_t file_bytes = static_cast<uint64_t>(st.st_size);
     siligemma::SlgbHeader hdr{};
     pread_exact(fd, &hdr, sizeof(hdr), 0ULL);
     if (hdr.magic != siligemma::SLGB_MAGIC || hdr.version != siligemma::SLGB_VERSION) {
         std::fprintf(stderr, "Bad SLGB magic/version\n");
-        return 1;
-    }
-    if (hdr.bos_token_id != siligemma::GEMMA4_BOS_TOKEN_ID) {
-        std::fprintf(stderr, "Bad bos_token_id=%u\n", hdr.bos_token_id);
+        ::close(fd);
         return 1;
     }
     std::array<siligemma::SiliGemmaLayerDesc, siligemma::GEMMA4_NUM_LAYERS> layers{};
+    const uint64_t min_meta = sizeof(hdr) + layers.size() * sizeof(siligemma::SiliGemmaLayerDesc)
+                            + siligemma::LIVE_LINEAR_COUNT * sizeof(siligemma::SiliGemmaLinearDesc);
+    if (file_bytes < min_meta) {
+        std::fprintf(stderr, "slgb descriptor table truncated\n");
+        ::close(fd);
+        return 1;
+    }
     uint64_t off = sizeof(hdr);
     pread_exact(fd, layers.data(), layers.size() * sizeof(siligemma::SiliGemmaLayerDesc), off);
     off += layers.size() * sizeof(siligemma::SiliGemmaLayerDesc);
@@ -411,9 +440,10 @@ static int cmd_verify(const char* slgb_path) {
     pread_exact(fd, linears.data(), linears.size() * sizeof(siligemma::SiliGemmaLinearDesc), off);
     off += linears.size() * sizeof(siligemma::SiliGemmaLinearDesc);
 
-    const uint32_t valid_toks[2] = {2u, 100u};
-    if (siligemma::validate_runtime_contract(hdr, layers, linears, valid_toks, 2u) != siligemma::ValidationError::OK) {
-        std::fprintf(stderr, "validate_runtime_contract failed\n");
+    const siligemma::ValidationError verr = siligemma::validate_slgb_file_layout(hdr, layers, linears, file_bytes, true);
+    if (verr != siligemma::ValidationError::OK) {
+        std::fprintf(stderr, "validate_slgb_file_layout failed err=%d\n", static_cast<int>(verr));
+        ::close(fd);
         return 1;
     }
 
