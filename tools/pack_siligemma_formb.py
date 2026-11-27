@@ -17,6 +17,7 @@ import math
 import os
 from pathlib import Path
 import random
+import re
 import shutil
 import struct
 import subprocess
@@ -362,6 +363,23 @@ def validate_safetensors_tensor_spans(hdr: dict[str, Any], geom: dict[str, Any],
         prev_key = key
 
 
+def _verify_worker_outputs(pack_stdout: str, verify_stdout: str) -> None:
+    m1 = re.search(r"\bPACK_COMPLETE\s+linears=(\d+)\s+embeds=(\d+)\s+norms=(\d+)\b", pack_stdout)
+    if not m1:
+        raise RuntimeError(f"Worker --pack output missing summary counts: {pack_stdout!r}")
+    geom = build_gemma4_descriptor_geometry(32)
+    exp_linears = LIVE_LINEAR_COUNT
+    exp_norms = len(geom["norm_specs"])
+    if (int(m1.group(1)), int(m1.group(2)), int(m1.group(3))) != (exp_linears, 1, exp_norms):
+        raise RuntimeError(f"Worker --pack incomplete job counts: {m1.group(0)!r}")
+    exp_words = (sum(int(d["out_dim"]) * int(d["in_dim"]) for d in geom["linears"]) + GEMMA4_VOCAB * GEMMA4_HIDDEN) // 16
+    m2 = re.search(r"\bSLGB_VERIFY_PASS\s+total_words=(\d+)\s+secded_errors=0\b", verify_stdout)
+    if not m2:
+        raise RuntimeError(f"Worker --verify output missing SLGB_VERIFY_PASS: {verify_stdout!r}")
+    if int(m2.group(1)) != exp_words:
+        raise RuntimeError(f"Worker --verify word count mismatch: {m2.group(1)} != {exp_words}")
+
+
 def pack_safetensors_to_slgb(st_path: Path, slgb_out: Path) -> dict[str, Any]:
     """Stream google/gemma-4-E2B-it model.safetensors -> g=32 Form B .slgb in < 250 MiB RAM."""
     st_resolved = st_path.resolve()
@@ -428,6 +446,7 @@ def pack_safetensors_to_slgb(st_path: Path, slgb_out: Path) -> dict[str, Any]:
             p2 = subprocess.run([str(worker), "--verify", str(tmp_slgb)], capture_output=True, text=True, check=False)
             if p2.returncode != 0:
                 raise RuntimeError(f"Worker --verify failed:\n{p2.stderr}\n{p2.stdout}")
+            _verify_worker_outputs(p1.stdout, p2.stdout)
         os.replace(tmp_slgb, slgb_out)
     finally:
         if tmp_slgb.exists():

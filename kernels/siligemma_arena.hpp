@@ -575,7 +575,8 @@ inline ValidationError validate_runtime_contract(
     const std::array<SiliGemmaLayerDesc, GEMMA4_NUM_LAYERS>& layers,
     const std::vector<SiliGemmaLinearDesc>& linears,
     const uint32_t* tokens,
-    size_t n_tokens
+    size_t n_tokens,
+    bool require_crc32 = false
 ) noexcept {
     if (hdr.magic != SLGB_MAGIC) return ValidationError::ERR_BAD_MAGIC;
     if (hdr.version != SLGB_VERSION) return ValidationError::ERR_BAD_VERSION;
@@ -592,6 +593,9 @@ inline ValidationError validate_runtime_contract(
         hdr.rms_norm_eps != GEMMA4_RMS_NORM_EPS || hdr.flags > 3u) {
         return ValidationError::ERR_BAD_TOPOLOGY;
     }
+    if (require_crc32 && hdr.header_crc32 == 0u) {
+        return ValidationError::ERR_BAD_CRC32;
+    }
     if (hdr.header_crc32 != 0u && hdr.header_crc32 != compute_slgb_header_crc32(hdr)) {
         return ValidationError::ERR_BAD_CRC32;
     }
@@ -603,16 +607,22 @@ inline ValidationError validate_runtime_contract(
     const uint64_t expected_wire = (hdr.group_size == 32u) ? WIRE_BYTES_G32_45BPW : WIRE_BYTES_G128_4125BPW;
     if (hdr.total_wire_bytes != expected_wire) return ValidationError::ERR_BAD_WIRE_BYTES;
 
+    std::array<uint8_t, LIVE_LINEAR_COUNT> linear_seen{};
     for (uint32_t l = 0u; l < GEMMA4_NUM_LAYERS; ++l) {
         const auto& ly = layers[l];
         if (ly.layer_idx != l) return ValidationError::ERR_BAD_TOPOLOGY;
+        const bool expected_full = ((l % 5u) == 4u);
+        if ((ly.is_full_attn != 0u) != expected_full) return ValidationError::ERR_BAD_TOPOLOGY;
         const bool expected_shared = (l >= GEMMA4_FIRST_SHARED_LAYER);
         if ((ly.is_kv_shared != 0u) != expected_shared) return ValidationError::ERR_BAD_TOPOLOGY;
+        const uint32_t exp_hd = expected_full ? GEMMA4_GLOBAL_HEAD_DIM : GEMMA4_SLIDING_HEAD_DIM;
+        const uint32_t exp_ff = expected_shared ? GEMMA4_INTERMEDIATE_HI : GEMMA4_INTERMEDIATE_LO;
+        if (ly.head_dim != exp_hd || ly.intermediate_size != exp_ff) return ValidationError::ERR_BAD_DIMS;
         if (expected_shared) {
             if (ly.linear_idx[1] >= 0 || ly.linear_idx[2] >= 0 || ly.norm_offsets_f32[6] >= 0) {
                 return ValidationError::ERR_DEAD_KV_PRESENT;
             }
-            const uint32_t exp_src = ly.is_full_attn ? GEMMA4_KV_STORE_FULL : GEMMA4_KV_STORE_SLIDING;
+            const uint32_t exp_src = expected_full ? GEMMA4_KV_STORE_FULL : GEMMA4_KV_STORE_SLIDING;
             if (ly.kv_source_layer != exp_src) return ValidationError::ERR_BAD_KV_SOURCE;
         } else {
             if (ly.linear_idx[1] < 0 || ly.linear_idx[2] < 0 || ly.norm_offsets_f32[6] < 0) {
@@ -620,13 +630,65 @@ inline ValidationError validate_runtime_contract(
             }
             if (ly.kv_source_layer != l) return ValidationError::ERR_BAD_KV_SOURCE;
         }
+        for (int n = 0; n < 8; ++n) {
+            if (expected_shared && n == 6) continue;
+            const int32_t noff = ly.norm_offsets_f32[n];
+            const uint32_t nspan = (n < 5) ? GEMMA4_HIDDEN_SIZE : ((n < 7) ? exp_hd : 1u);
+            if (noff < 0 || static_cast<uint64_t>(noff) + static_cast<uint64_t>(nspan) > NORM_SCALAR_PARAMS_FP32) {
+                return ValidationError::ERR_BAD_DIMS;
+            }
+        }
+        const int32_t H = static_cast<int32_t>(GEMMA4_HIDDEN_SIZE);
+        const int32_t Q_DIM = static_cast<int32_t>(GEMMA4_NUM_ATTN_HEADS * exp_hd);
+        const int32_t KV_DIM = static_cast<int32_t>(GEMMA4_NUM_KV_HEADS * exp_hd);
+        const int32_t FF = static_cast<int32_t>(exp_ff);
+        const int32_t PLE = static_cast<int32_t>(GEMMA4_PLE_DIM);
+        const int32_t exp_out[9] = {Q_DIM, KV_DIM, KV_DIM, H, FF, FF, H, PLE, H};
+        const int32_t exp_in[9] = {H, H, H, Q_DIM, H, H, FF, H, PLE};
+        for (int r = 0; r < 9; ++r) {
+            if (expected_shared && (r == 1 || r == 2)) continue;
+            const int32_t idx = ly.linear_idx[r];
+            if (idx < 0 || static_cast<size_t>(idx) >= LIVE_LINEAR_COUNT) {
+                return ValidationError::ERR_BAD_LINEAR_COUNT;
+            }
+            if (linear_seen[static_cast<size_t>(idx)] != 0u) {
+                return ValidationError::ERR_BAD_TOPOLOGY;
+            }
+            linear_seen[static_cast<size_t>(idx)] = 1u;
+            const auto& ld = linears[static_cast<size_t>(idx)];
+            if (ld.layer_idx != l || ld.role_id != static_cast<uint32_t>(r)) {
+                return ValidationError::ERR_BAD_TOPOLOGY;
+            }
+            if (ld.out_dim != exp_out[r] || ld.in_dim != exp_in[r]) {
+                return ValidationError::ERR_BAD_DIMS;
+            }
+        }
     }
-    for (const auto& d : linears) {
+    size_t global_ple_cnt = 0u;
+    for (size_t i = 0u; i < linears.size(); ++i) {
+        const auto& d = linears[i];
         if (d.in_dim <= 0 || d.out_dim <= 0 || (d.in_dim % 128) != 0 || (d.out_dim % 16) != 0 ||
             d.group_size != static_cast<int32_t>(hdr.group_size)) {
             return ValidationError::ERR_BAD_DIMS;
         }
+        const uint64_t wb = linear_wire_words_bytes(d.out_dim, d.in_dim);
+        const uint64_t sb = linear_wire_scales_bytes(d.out_dim, d.in_dim, d.group_size);
+        if (d.words_byte_offset > hdr.total_wire_bytes || wb > (hdr.total_wire_bytes - d.words_byte_offset) ||
+            d.scales_byte_offset > hdr.total_wire_bytes || sb > (hdr.total_wire_bytes - d.scales_byte_offset) ||
+            d.scales_byte_offset < (d.words_byte_offset + wb)) {
+            return ValidationError::ERR_BAD_WIRE_BYTES;
+        }
+        if (linear_seen[i] == 0u) {
+            if (d.layer_idx != 0xFFFFFFFFu ||
+                d.role_id != static_cast<uint32_t>(LinearRole::GLOBAL_PLE_MODEL_PROJ) ||
+                d.out_dim != static_cast<int32_t>(GEMMA4_NUM_LAYERS * GEMMA4_PLE_DIM) ||
+                d.in_dim != static_cast<int32_t>(GEMMA4_HIDDEN_SIZE)) {
+                return ValidationError::ERR_BAD_TOPOLOGY;
+            }
+            ++global_ple_cnt;
+        }
     }
+    if (global_ple_cnt != 1u) return ValidationError::ERR_BAD_TOPOLOGY;
     return ValidationError::OK;
 }
 
@@ -638,7 +700,7 @@ inline ValidationError validate_slgb_file_layout(
     bool require_crc32 = true
 ) {
     const uint32_t dummy_tok[1] = {GEMMA4_BOS_TOKEN_ID};
-    const ValidationError base_err = validate_runtime_contract(hdr, layers, linears, dummy_tok, 1u);
+    const ValidationError base_err = validate_runtime_contract(hdr, layers, linears, dummy_tok, 1u, require_crc32);
     if (base_err != ValidationError::OK) return base_err;
     if (require_crc32 && hdr.header_crc32 == 0u) return ValidationError::ERR_BAD_CRC32;
     if (hdr.header_crc32 != 0u && hdr.header_crc32 != compute_slgb_header_crc32(hdr)) {
@@ -872,7 +934,13 @@ inline ValidationError evaluate_riccati_loop_guard(
     const float dot_val = canonical_tree_sum_block128_f32(dot_pc.data(), dim);
 
     out_step_ratio = n_diff / (n_prev + 1.0e-6f);
-    out_cos = (n_prev > 1.0e-12f && n_cur > 1.0e-12f) ? (dot_val / (n_prev * n_cur)) : 0.0f;
+    if (n_prev > 1.0e-12f && n_cur > 1.0e-12f) {
+        out_cos = dot_val / (n_prev * n_cur);
+    } else if (n_diff <= 1.0e-12f) {
+        out_cos = 1.0f;
+    } else {
+        out_cos = 0.0f;
+    }
 
     out_rho_hat = 0.0;
     if (prev_delta != nullptr) {

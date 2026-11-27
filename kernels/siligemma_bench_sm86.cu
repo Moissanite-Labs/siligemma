@@ -10,7 +10,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -200,7 +202,19 @@ static BenchCliArgs parse_cli_args(int argc, char** argv) {
         } else if (std::strcmp(arg, "--ple-safetensors") == 0 && i + 1 < argc) {
             a.ple_safetensors = argv[++i];
         } else if (std::strcmp(arg, "--ple-offset") == 0 && i + 1 < argc) {
-            a.ple_offset = std::strtoull(argv[++i], nullptr, 10);
+            const char* raw_off = argv[++i];
+            if (raw_off[0] < '0' || raw_off[0] > '9') {
+                std::fprintf(stderr, "Invalid --ple-offset: %s\n", raw_off);
+                std::exit(2);
+            }
+            errno = 0;
+            char* endptr = nullptr;
+            const unsigned long long parsed = std::strtoull(raw_off, &endptr, 10);
+            if (errno == ERANGE || endptr == raw_off || *endptr != '\0') {
+                std::fprintf(stderr, "Invalid or overflowing --ple-offset: %s\n", raw_off);
+                std::exit(2);
+            }
+            a.ple_offset = static_cast<uint64_t>(parsed);
             a.has_ple_offset = true;
         } else if (std::strcmp(arg, "--tokens-bin") == 0 && i + 1 < argc) {
             a.tokens_bin = argv[++i];
@@ -723,7 +737,6 @@ static CapturedGraph capture_full_step_graph(
     __nv_bfloat16* d_ple_dma_slot,
     bool enable_hub_steer,
     float hub_alpha,
-    bool keep_unnormalized_logits,
     cudaStream_t stream_compute,
     cudaStream_t stream_dma,
     cudaEvent_t ev_fork,
@@ -849,7 +862,6 @@ static CapturedGraph capture_full_step_graph(
         }
     }
 
-    (void)keep_unnormalized_logits;
     siligemma_sm86::siligemma_iris_canary_finalize_sm86<<<1, 128, 0, stream_compute>>>(
         cur_h, p.dev_canary, 34u, static_cast<uint32_t>(loop_k), 0u, 0, H
     );
@@ -971,35 +983,71 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
             std::string hdr_json(static_cast<size_t>(hdr_len), '\0');
             pread_exact(ple_fd, hdr_json.data(), static_cast<size_t>(hdr_len), sizeof(hdr_len));
 
-            const std::string target_key = "\"model.language_model.embed_tokens_per_layer.weight\"";
-            const size_t kpos = hdr_json.find(target_key);
-            SG_REQUIRE(kpos != std::string::npos, "PLE tensor missing from safetensors header");
-            size_t obj_start = hdr_json.find('{', kpos + target_key.size());
-            SG_REQUIRE(obj_start != std::string::npos, "Malformed PLE JSON object start");
-            int depth = 0;
-            bool in_str = false;
-            bool esc = false;
+            const std::string target_raw = "model.language_model.embed_tokens_per_layer.weight";
+            size_t obj_start = std::string::npos;
             size_t obj_end = std::string::npos;
-            for (size_t idx = obj_start; idx < hdr_json.size(); ++idx) {
-                const char ch = hdr_json[idx];
-                if (in_str) {
-                    if (esc) { esc = false; }
-                    else if (ch == '\\') { esc = true; }
-                    else if (ch == '"') { in_str = false; }
-                    continue;
-                }
-                if (ch == '"') { in_str = true; }
-                else if (ch == '{') { ++depth; }
-                else if (ch == '}') {
-                    --depth;
-                    if (depth == 0) { obj_end = idx; break; }
+            size_t match_count = 0u;
+            {
+                int depth = 0;
+                bool in_str = false;
+                bool esc = false;
+                bool expect_key = false;
+                bool capture_next_obj = false;
+                std::string cur_str;
+                for (size_t idx = 0u; idx < hdr_json.size(); ++idx) {
+                    const char ch = hdr_json[idx];
+                    if (in_str) {
+                        if (esc) { cur_str.push_back(ch); esc = false; }
+                        else if (ch == '\\') { cur_str.push_back(ch); esc = true; }
+                        else if (ch == '"') {
+                            in_str = false;
+                            if (depth == 1 && expect_key) {
+                                expect_key = false;
+                                if (cur_str == target_raw) {
+                                    capture_next_obj = true;
+                                    ++match_count;
+                                    SG_REQUIRE(match_count == 1u, "Duplicate PLE tensor key in safetensors header");
+                                }
+                            }
+                        } else {
+                            if (depth == 1 && expect_key && cur_str.size() < 256u) cur_str.push_back(ch);
+                        }
+                        continue;
+                    }
+                    if (ch == '"') {
+                        in_str = true;
+                        if (depth == 1 && expect_key) cur_str.clear();
+                    } else if (ch == '{') {
+                        ++depth;
+                        if (depth == 1) {
+                            expect_key = true;
+                        } else if (depth == 2 && capture_next_obj) {
+                            obj_start = idx;
+                        }
+                    } else if (ch == '}') {
+                        if (depth == 2 && capture_next_obj) {
+                            obj_end = idx;
+                            capture_next_obj = false;
+                        }
+                        --depth;
+                        if (depth == 1) expect_key = false;
+                    } else if (ch == ',' && depth == 1) {
+                        expect_key = true;
+                    }
                 }
             }
-            SG_REQUIRE(obj_end != std::string::npos, "Malformed PLE safetensors JSON object braces");
+            SG_REQUIRE(match_count == 1u && obj_start != std::string::npos && obj_end != std::string::npos,
+                       "PLE tensor missing or malformed in safetensors header");
             const std::string entry = hdr_json.substr(obj_start, obj_end - obj_start + 1u);
 
             auto skip_ws = [&](size_t& p) {
                 while (p < entry.size() && (entry[p] == ' ' || entry[p] == '\t' || entry[p] == '\n' || entry[p] == '\r')) ++p;
+            };
+            auto find_unique_entry_key = [&](const std::string& key) -> size_t {
+                const size_t pos = entry.find(key);
+                SG_REQUIRE(pos != std::string::npos, "PLE tensor missing required metadata key");
+                SG_REQUIRE(entry.find(key, pos + key.size()) == std::string::npos, "Duplicate key in PLE tensor metadata");
+                return pos;
             };
             auto parse_u64 = [&](size_t& p, uint64_t& out) -> bool {
                 skip_ws(p);
@@ -1015,15 +1063,13 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
                 return true;
             };
 
-            const size_t dt_k = entry.find("\"dtype\"");
-            SG_REQUIRE(dt_k != std::string::npos, "PLE tensor missing dtype");
+            const size_t dt_k = find_unique_entry_key("\"dtype\"");
             size_t dt_c = entry.find(':', dt_k + 7u);
             SG_REQUIRE(dt_c != std::string::npos, "Malformed PLE dtype");
             ++dt_c; skip_ws(dt_c);
             SG_REQUIRE(dt_c + 6u <= entry.size() && entry.compare(dt_c, 6u, "\"BF16\"") == 0, "PLE tensor dtype must be BF16");
 
-            const size_t sh_k = entry.find("\"shape\"");
-            SG_REQUIRE(sh_k != std::string::npos, "PLE tensor missing shape");
+            const size_t sh_k = find_unique_entry_key("\"shape\"");
             size_t sh_p = entry.find('[', sh_k + 7u);
             SG_REQUIRE(sh_p != std::string::npos, "Malformed PLE shape array");
             ++sh_p;
@@ -1036,8 +1082,7 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
             skip_ws(sh_p);
             SG_REQUIRE(sh_p < entry.size() && entry[sh_p] == ']', "Malformed PLE shape closing bracket");
 
-            const size_t do_k = entry.find("\"data_offsets\"");
-            SG_REQUIRE(do_k != std::string::npos, "PLE tensor missing data_offsets");
+            const size_t do_k = find_unique_entry_key("\"data_offsets\"");
             size_t do_p = entry.find('[', do_k + 14u);
             SG_REQUIRE(do_p != std::string::npos, "Malformed PLE data_offsets");
             ++do_p;
@@ -1376,7 +1421,7 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
             std::memset(host_canary, 0, sizeof(*host_canary));
             CapturedGraph g_prompt = capture_full_step_graph(
                 ptrs, m, h_norms, 1, 1, use_4p5_lm, 0, true, true,
-                h_ple_pin, ptrs.d_ple_stage_0, false, 0.0f, true,
+                h_ple_pin, ptrs.d_ple_stage_0, false, 0.0f,
                 stream_compute, stream_dma, ev_fork, ev_dma_done
             );
             SG_REQUIRE(prompt_tokens.size() <= static_cast<size_t>(AL.t_max), "prompt_tokens exceeds arena t_max capacity");
@@ -1409,10 +1454,11 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
         run_prompt_and_dump(true, args.dump_logits_4p5);
 
         // Real WT2_test B=16 NLL in bare-metal CUDA (K=1,2,3 BF16 lm_head + K=1 4.5bpw lm_head)
+        const bool wt2_cuda_measured = !args.wt2_bin.empty();
         double wt2_cuda_k1_bf16 = 0.0, wt2_cuda_k1_4p5 = 0.0, wt2_cuda_k2_bf16 = 0.0, wt2_cuda_k3_bf16 = 0.0;
         double wt2_cuda_k2_cos = 0.0, wt2_cuda_k2_step_ratio = 0.0;
         double wt2_cuda_k3_rho_hat = 0.0, wt2_cuda_k3_step_ratio = 0.0, wt2_cuda_k3_cos = 0.0;
-        if (!args.wt2_bin.empty()) {
+        if (wt2_cuda_measured) {
             std::vector<uint32_t> wt2_flat;
             read_u32_vec_bin(args.wt2_bin, wt2_flat);
             SG_REQUIRE(wt2_flat.size() == 16ULL * 256ULL, "wt2-bin must be 16x256 uint32");
@@ -1427,7 +1473,7 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
                 std::memset(host_canary, 0, sizeof(*host_canary));
                 CapturedGraph g_w = capture_full_step_graph(
                     ptrs, m, h_norms, 16, k_pass, use_4p5, 0, true, true,
-                    h_ple_pin, ptrs.d_ple_stage_0, false, 0.0f, true,
+                    h_ple_pin, ptrs.d_ple_stage_0, false, 0.0f,
                     stream_compute, stream_dma, ev_fork, ev_dma_done
                 );
                 std::vector<float> h_logits(16ULL * siligemma::GEMMA4_VOCAB_SIZE);
@@ -1474,7 +1520,10 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
                 for (size_t j = 0; j < 1536ULL; ++j) h_l33_p1_f[j] = bf16_bits_to_f32(h_l33_p1[j]);
                 double dummy_rho = 0.0;
                 float sr = 0.0f, cs = 0.0f;
-                siligemma::evaluate_riccati_loop_guard(h_l33_p1_f.data(), h_l33_p2.data(), nullptr, 1536u, 2u, dummy_rho, sr, cs);
+                const siligemma::ValidationError k2_guard_err = siligemma::evaluate_riccati_loop_guard(
+                    h_l33_p1_f.data(), h_l33_p2.data(), nullptr, 1536u, 2u, dummy_rho, sr, cs
+                );
+                SG_REQUIRE(k2_guard_err == siligemma::ValidationError::OK, "K=2 loop step divergence guard failed");
                 wt2_cuda_k2_step_ratio = static_cast<double>(sr);
                 wt2_cuda_k2_cos = static_cast<double>(cs);
             }
@@ -1492,7 +1541,10 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
                 }
                 double rho3 = 0.0;
                 float sr3 = 0.0f, cs3 = 0.0f;
-                siligemma::evaluate_riccati_loop_guard(h_p2.data(), h_p3.data(), h_prev_delta.data(), 1536u, 3u, rho3, sr3, cs3);
+                const siligemma::ValidationError k3_guard_err = siligemma::evaluate_riccati_loop_guard(
+                    h_p2.data(), h_p3.data(), h_prev_delta.data(), 1536u, 3u, rho3, sr3, cs3
+                );
+                SG_REQUIRE(k3_guard_err == siligemma::ValidationError::OK, "K=3 Riccati contraction guard failed");
                 wt2_cuda_k3_rho_hat = rho3;
                 wt2_cuda_k3_step_ratio = static_cast<double>(sr3);
                 wt2_cuda_k3_cos = static_cast<double>(cs3);
@@ -1517,12 +1569,12 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
             // AB/BA async PLE DMA vs pre-resident at K=1 B=1 T=128
             CapturedGraph g_no_dma = capture_full_step_graph(
                 ptrs, m, h_norms, 1, 1, true, 127, false, false,
-                h_ple_pin, ptrs.d_ple_stage_0, false, 0.0f, false,
+                h_ple_pin, ptrs.d_ple_stage_0, false, 0.0f,
                 stream_compute, stream_dma, ev_fork, ev_dma_done
             );
             CapturedGraph g_with_dma = capture_full_step_graph(
                 ptrs, m, h_norms, 1, 1, true, 127, false, true,
-                h_ple_pin, ptrs.d_ple_stage_0, false, 0.0f, false,
+                h_ple_pin, ptrs.d_ple_stage_0, false, 0.0f,
                 stream_compute, stream_dma, ev_fork, ev_dma_done
             );
             std::vector<double> t_no, t_with;
@@ -1534,12 +1586,12 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
             // 1,000-step 0 B dynamic alloc check (K=1 + K=2 + K=3 sanity steps)
             CapturedGraph g_k2 = capture_full_step_graph(
                 ptrs, m, h_norms, 1, 2, true, 127, false, true,
-                h_ple_pin, ptrs.d_ple_stage_0, false, 0.0f, false,
+                h_ple_pin, ptrs.d_ple_stage_0, false, 0.0f,
                 stream_compute, stream_dma, ev_fork, ev_dma_done
             );
             CapturedGraph g_k3 = capture_full_step_graph(
                 ptrs, m, h_norms, 1, 3, true, 127, false, true,
-                h_ple_pin, ptrs.d_ple_stage_0, false, 0.0f, false,
+                h_ple_pin, ptrs.d_ple_stage_0, false, 0.0f,
                 stream_compute, stream_dma, ev_fork, ev_dma_done
             );
             // Warmup graphs once so driver state is settled
@@ -1602,7 +1654,7 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
                 for (bool use_4p5 : {true, false}) {
                     CapturedGraph g = capture_full_step_graph(
                         ptrs, m, h_norms, B, k_pass, use_4p5, eval_pos, false, true,
-                        h_ple_pin, ptrs.d_ple_stage_0, false, 0.0f, false,
+                        h_ple_pin, ptrs.d_ple_stage_0, false, 0.0f,
                         stream_compute, stream_dma, ev_fork, ev_dma_done
                     );
                     cudaEvent_t e0 = nullptr, e1 = nullptr;
@@ -1660,12 +1712,12 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
 
             CapturedGraph g_hb = capture_full_step_graph(
                 ptrs, m, h_norms, 1, 1, true, 127, false, true,
-                h_ple_pin, ptrs.d_ple_stage_0, false, 0.0f, false,
+                h_ple_pin, ptrs.d_ple_stage_0, false, 0.0f,
                 stream_compute, stream_dma, ev_fork, ev_dma_done
             );
             CapturedGraph g_hs = capture_full_step_graph(
                 ptrs, m, h_norms, 1, 1, true, 127, false, true,
-                h_ple_pin, ptrs.d_ple_stage_0, true, 0.20f, false,
+                h_ple_pin, ptrs.d_ple_stage_0, true, 0.20f,
                 stream_compute, stream_dma, ev_fork, ev_dma_done
             );
             std::vector<double> tb, ts;
@@ -1713,15 +1765,23 @@ static int run_live_gpu_bench(const BenchCliArgs& args) {
             jout << "  \"hub_l10_14_base_ms\": " << hub_base_ms << ",\n";
             jout << "  \"hub_l10_14_steer_ms\": " << hub_steer_ms << ",\n";
             jout << "  \"hub_l10_14_overhead_pct\": " << hub_overhead_pct << ",\n";
-            jout << "  \"wt2_cuda_k1_bf16_nll\": " << wt2_cuda_k1_bf16 << ",\n";
-            jout << "  \"wt2_cuda_k1_4p5_nll\": " << wt2_cuda_k1_4p5 << ",\n";
-            jout << "  \"wt2_cuda_k2_bf16_nll\": " << wt2_cuda_k2_bf16 << ",\n";
-            jout << "  \"wt2_cuda_k3_bf16_nll\": " << wt2_cuda_k3_bf16 << ",\n";
-            jout << "  \"wt2_cuda_k2_step_ratio\": " << wt2_cuda_k2_step_ratio << ",\n";
-            jout << "  \"wt2_cuda_k2_cos\": " << wt2_cuda_k2_cos << ",\n";
-            jout << "  \"wt2_cuda_k3_rho_hat\": " << wt2_cuda_k3_rho_hat << ",\n";
-            jout << "  \"wt2_cuda_k3_step_ratio\": " << wt2_cuda_k3_step_ratio << ",\n";
-            jout << "  \"wt2_cuda_k3_cos\": " << wt2_cuda_k3_cos << ",\n";
+            auto emit_opt_f64 = [&](const char* key, double val) {
+                jout << "  \"" << key << "\": ";
+                if (wt2_cuda_measured) jout << val;
+                else jout << "null";
+                jout << ",\n";
+            };
+            jout << "  \"wt2_cuda_measured\": " << (wt2_cuda_measured ? "true" : "false") << ",\n";
+            jout << "  \"riccati_guards_enforced\": " << (wt2_cuda_measured ? "true" : "false") << ",\n";
+            emit_opt_f64("wt2_cuda_k1_bf16_nll", wt2_cuda_k1_bf16);
+            emit_opt_f64("wt2_cuda_k1_4p5_nll", wt2_cuda_k1_4p5);
+            emit_opt_f64("wt2_cuda_k2_bf16_nll", wt2_cuda_k2_bf16);
+            emit_opt_f64("wt2_cuda_k3_bf16_nll", wt2_cuda_k3_bf16);
+            emit_opt_f64("wt2_cuda_k2_step_ratio", wt2_cuda_k2_step_ratio);
+            emit_opt_f64("wt2_cuda_k2_cos", wt2_cuda_k2_cos);
+            emit_opt_f64("wt2_cuda_k3_rho_hat", wt2_cuda_k3_rho_hat);
+            emit_opt_f64("wt2_cuda_k3_step_ratio", wt2_cuda_k3_step_ratio);
+            emit_opt_f64("wt2_cuda_k3_cos", wt2_cuda_k3_cos);
             jout << "  \"canary_final_ded_count\": " << host_canary->ded_count_u32 << ",\n";
             jout << "  \"canary_final_sec_count\": " << host_canary->sec_count_u32 << ",\n";
             jout << "  \"throughput_matrix\": [\n";

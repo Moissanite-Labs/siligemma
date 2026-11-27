@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cfenv>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -349,6 +351,7 @@ static int cmd_pack(const char* st_path, const char* slgb_path, const char* jobs
     std::vector<uint16_t> scales_buf;
     std::vector<float> f32_buf;
     uint64_t total_linears_done = 0u;
+    uint64_t total_embeds_done = 0u;
     uint64_t total_norms_done = 0u;
     auto span_fits = [](uint64_t off, uint64_t len, uint64_t lim) -> bool {
         return off <= lim && len <= (lim - off);
@@ -419,6 +422,7 @@ static int cmd_pack(const char* st_path, const char* slgb_path, const char* jobs
                 pwrite_exact(fd_out, words_buf.data(), words_buf.size() * sizeof(uint64_t), dst_w);
                 pwrite_exact(fd_out, scales_buf.data(), scales_buf.size() * sizeof(uint16_t), dst_s);
             }
+            ++total_embeds_done;
         } else if (kind == "NORM") {
             size_t cnt = 0;
             uint64_t in_off = 0, out_off = 0;
@@ -444,10 +448,23 @@ static int cmd_pack(const char* st_path, const char* slgb_path, const char* jobs
     }
     ::close(fd_in);
     ::close(fd_out);
-    std::printf("PACK_COMPLETE linears=%llu norms=%llu\n",
+    std::printf("PACK_COMPLETE linears=%llu embeds=%llu norms=%llu\n",
                 static_cast<unsigned long long>(total_linears_done),
+                static_cast<unsigned long long>(total_embeds_done),
                 static_cast<unsigned long long>(total_norms_done));
     return 0;
+}
+
+static bool parse_positive_int_strict(const char* s, int max_val, int& out) noexcept {
+    if (s == nullptr || s[0] < '0' || s[0] > '9') return false;
+    errno = 0;
+    char* endptr = nullptr;
+    const long v = std::strtol(s, &endptr, 10);
+    if (errno == ERANGE || endptr == s || *endptr != '\0' || v <= 0 || v > max_val) {
+        return false;
+    }
+    out = static_cast<int>(v);
+    return true;
 }
 
 static int cmd_verify(const char* slgb_path) {
@@ -489,37 +506,107 @@ static int cmd_verify(const char* slgb_path) {
         return 1;
     }
 
-    uint64_t off_p1 = siligemma::align_up_n(off, 256ULL);
-    uint64_t off_p2_emb = siligemma::align_up_n(off_p1 + hdr.total_wire_bytes, 256ULL);
-    uint64_t off_p2_lm = siligemma::align_up_n(off_p2_emb + siligemma::EMBED_TOKENS_BF16_BYTES, 256ULL);
+    const uint64_t off_p1 = siligemma::align_up_n(off, 256ULL);
+    const uint64_t off_p2_emb = siligemma::align_up_n(off_p1 + hdr.total_wire_bytes, 256ULL);
+    const uint64_t off_p2_lm = siligemma::align_up_n(off_p2_emb + siligemma::EMBED_TOKENS_BF16_BYTES, 256ULL);
+    const uint64_t off_p3_norms = siligemma::align_up_n(
+        (hdr.flags & 1u) ? (off_p2_lm + siligemma::LM_HEAD_SHADOW_G32_BYTES)
+                         : (off_p2_emb + siligemma::EMBED_TOKENS_BF16_BYTES),
+        256ULL
+    );
+    const uint64_t off_p4_loop = siligemma::align_up_n(
+        off_p3_norms + static_cast<uint64_t>(siligemma::NORM_SCALAR_PARAMS_FP32) * sizeof(float),
+        256ULL
+    );
 
     uint64_t total_words = 0ULL;
     uint64_t syn_errors = 0ULL;
     std::vector<uint64_t> chunk_u64(4ULL * 1024ULL * 1024ULL);
 
-    auto scan_words = [&](uint64_t base_off, uint64_t n_words) {
+    auto scan_words = [&](uint64_t base_off, uint64_t n_words) -> uint64_t {
         uint64_t done = 0ULL;
+        uint64_t nonzero = 0ULL;
         while (done < n_words) {
             size_t cnt = static_cast<size_t>(std::min<uint64_t>(n_words - done, chunk_u64.size()));
             pread_exact(fd, chunk_u64.data(), cnt * sizeof(uint64_t), base_off + done * sizeof(uint64_t));
             for (size_t i = 0; i < cnt; ++i) {
-                if (siligemma::a16_secded_syndrome_cpu(chunk_u64[i]) != 0u) ++syn_errors;
+                const uint64_t w64 = chunk_u64[i];
+                if (w64 != 0ULL) ++nonzero;
+                if (siligemma::a16_secded_syndrome_cpu(w64) != 0u) ++syn_errors;
             }
             total_words += cnt;
             done += cnt;
         }
+        return nonzero;
     };
 
     const uint64_t p1_words = siligemma::LIVE_LINEAR_PARAMS / 16ULL;
-    scan_words(off_p1, p1_words);
+    const uint64_t p1_nonzero = scan_words(off_p1, p1_words);
+    uint64_t lm_nonzero = 0ULL;
     if (hdr.flags & 1u) {
         const uint64_t lm_words = siligemma::EMBED_TOKENS_PARAMS / 16ULL;
-        scan_words(off_p2_lm, lm_words);
+        lm_nonzero = scan_words(off_p2_lm, lm_words);
+    }
+
+    // Verify P2 tied BF16 embed_tokens has finite values and non-zero weights
+    uint64_t emb_nonzero = 0ULL;
+    uint64_t emb_nonfinite = 0ULL;
+    {
+        const uint64_t emb_u16_cnt = siligemma::EMBED_TOKENS_PARAMS;
+        const size_t chunk_u16_cap = chunk_u64.size() * 4ULL;
+        const uint16_t* chunk_u16 = reinterpret_cast<const uint16_t*>(chunk_u64.data());
+        uint64_t done = 0ULL;
+        while (done < emb_u16_cnt) {
+            size_t cnt = static_cast<size_t>(std::min<uint64_t>(emb_u16_cnt - done, chunk_u16_cap));
+            pread_exact(fd, chunk_u64.data(), cnt * sizeof(uint16_t), off_p2_emb + done * sizeof(uint16_t));
+            for (size_t i = 0; i < cnt; ++i) {
+                const uint16_t b = chunk_u16[i];
+                if ((b & 0x7FFFu) != 0u) ++emb_nonzero;
+                if ((b & 0x7F80u) == 0x7F80u) ++emb_nonfinite;
+            }
+            done += cnt;
+        }
+    }
+
+    // Verify P3 norms are finite and non-zero
+    std::vector<float> norms(siligemma::NORM_SCALAR_PARAMS_FP32);
+    pread_exact(fd, norms.data(), norms.size() * sizeof(float), off_p3_norms);
+    uint64_t norms_nonzero = 0ULL;
+    uint64_t norms_nonfinite = 0ULL;
+    for (float v : norms) {
+        if (!std::isfinite(v)) ++norms_nonfinite;
+        if (v != 0.0f) ++norms_nonzero;
+    }
+
+    // Verify P4 loop controller BF16 weights are finite when present
+    uint64_t loop_nonfinite = 0ULL;
+    if (hdr.flags & 2u) {
+        std::vector<uint16_t> loop_bf16(siligemma::LOOP_CONTROLLER_PARAMS);
+        pread_exact(fd, loop_bf16.data(), siligemma::LOOP_CONTROLLER_BF16_BYTES, off_p4_loop);
+        for (uint16_t b : loop_bf16) {
+            if ((b & 0x7F80u) == 0x7F80u) ++loop_nonfinite;
+        }
     }
 
     ::close(fd);
     if (syn_errors != 0ULL) {
         std::fprintf(stderr, "SECDED errors detected: %llu\n", static_cast<unsigned long long>(syn_errors));
+        return 1;
+    }
+    if (p1_nonzero == 0ULL || ((hdr.flags & 1u) && lm_nonzero == 0ULL) ||
+        emb_nonzero == 0ULL || emb_nonfinite != 0ULL ||
+        norms_nonzero == 0ULL || norms_nonfinite != 0ULL || loop_nonfinite != 0ULL) {
+        std::fprintf(
+            stderr,
+            "SLGB payload content check failed: p1_nz=%llu lm_nz=%llu emb_nz=%llu emb_nf=%llu norm_nz=%llu norm_nf=%llu loop_nf=%llu\n",
+            static_cast<unsigned long long>(p1_nonzero),
+            static_cast<unsigned long long>(lm_nonzero),
+            static_cast<unsigned long long>(emb_nonzero),
+            static_cast<unsigned long long>(emb_nonfinite),
+            static_cast<unsigned long long>(norms_nonzero),
+            static_cast<unsigned long long>(norms_nonfinite),
+            static_cast<unsigned long long>(loop_nonfinite)
+        );
         return 1;
     }
     std::printf("SLGB_VERIFY_PASS total_words=%llu secded_errors=0\n",
@@ -534,11 +621,18 @@ static int cmd_selftest_quant(const char* in_bf16_path, int m, int k, const char
     }
     std::fesetround(FE_TONEAREST);
     const CosetTable ct = build_coset_table();
-    const size_t n = static_cast<size_t>(m) * static_cast<size_t>(k);
-    std::vector<uint16_t> bf16(n);
+    const uint64_t n = static_cast<uint64_t>(m) * static_cast<uint64_t>(k);
+    const uint64_t need_bytes = n * sizeof(uint16_t);
     int fd_i = ::open(in_bf16_path, O_RDONLY);
     if (fd_i < 0) return 1;
-    pread_exact(fd_i, bf16.data(), n * sizeof(uint16_t), 0ULL);
+    struct stat st_i{};
+    if (::fstat(fd_i, &st_i) != 0 || st_i.st_size < 0 || static_cast<uint64_t>(st_i.st_size) != need_bytes) {
+        std::fprintf(stderr, "selftest-quant input size mismatch\n");
+        ::close(fd_i);
+        return 1;
+    }
+    std::vector<uint16_t> bf16(static_cast<size_t>(n));
+    pread_exact(fd_i, bf16.data(), static_cast<size_t>(need_bytes), 0ULL);
     ::close(fd_i);
 
     std::vector<uint64_t> w(static_cast<size_t>(m) * static_cast<size_t>(k / 16));
@@ -569,7 +663,12 @@ int main(int argc, char** argv) {
         return cmd_pack(argv[2], argv[3], argv[4]);
     }
     if (argc >= 2 && std::string(argv[1]) == "--selftest-quant" && argc == 7) {
-        return cmd_selftest_quant(argv[2], std::atoi(argv[3]), std::atoi(argv[4]), argv[5], argv[6]);
+        int m = 0, k = 0;
+        if (!parse_positive_int_strict(argv[3], 65536, m) || !parse_positive_int_strict(argv[4], 65536, k)) {
+            std::fprintf(stderr, "Invalid selftest-quant integer dimensions\n");
+            return 2;
+        }
+        return cmd_selftest_quant(argv[2], m, k, argv[5], argv[6]);
     }
     std::fprintf(stderr, "Usage:\n  %s --pack <model.safetensors> <out.slgb> <jobs.txt>\n  %s --verify <in.slgb>\n", argv[0], argv[0]);
     return 2;
