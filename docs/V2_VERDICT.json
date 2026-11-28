@@ -1,0 +1,479 @@
+{
+  "arch_sha256": "b047f14809cdadd4e909a363caca9a2306a975f9876cbf109bed1c990e959d68",
+  "base_config_sha256": "1b28f3d2c3100f6c594754b81107428bd7b822a7f48272ca681dae9d2ec38330",
+  "dataset_anchors": {
+    "cd_test_n": 128,
+    "cd_test_seed": 175302,
+    "cd_train_n": 64,
+    "cd_train_seed": 175301,
+    "chunk_len": 256,
+    "gsm8k_test_sha256": "ee7b8da9e381df27b9e3f7758a159ab2bdaa4dbaa910546cbbc47e0cb44e4f59",
+    "gsm8k_train_sha256": "ea82612ea9582142387730c793eb67d3b12849002bc0b7fa6f8efafa7351419d",
+    "gsm_test_n": 128,
+    "gsm_train_n": 64,
+    "wt2_test_chunks": 16,
+    "wt2_test_sha256": "5f1bea067869d04849c0f975a2b29c4ff47d867f484f5010ea5e861eab246d91",
+    "wt2_val_chunks": 8,
+    "wt2_val_sha256": "204929b7ff9d6184953f867dedb860e40aa69c078fc1e54b3baaa8fb28511c4c"
+  },
+  "energy_disclaimer": "UNCONTROLLED_LAPTOP_NOT_CLAIMED: RTX 3080 Laptop thermal/power cap unconstrained; NVML 100 Hz readings are empirical observations rather than controlled power-efficiency claims.",
+  "experiment_id": "EXP-Q87",
+  "h1_config_sha256": "f1fe1e00cbfd3856e3b3925d2edbc7986ff5bcbd94c74371d418f2f9bec2d671",
+  "h1_model_safetensors_sha256": "a577b9ab55c36e5edb7140cf6477c8fbf957597ecfa5f30f4daed8c1f5290225",
+  "kill_gates": {
+    "arena_128k_le_cap": true,
+    "b16_k1_ge_870": true,
+    "b16_k1_ge_920_v2": true,
+    "b1_k1_ge_135": true,
+    "b1_k1_ge_150_kg_gfb3": true,
+    "non_vacuous_k2_u4_loopcd": true,
+    "nvml_100hz_all_arms_present": true,
+    "pareto_15550_within_cap": true,
+    "parity_b16_top1_and_err": true,
+    "parity_b1_k2_loopcd_top1_and_err": true,
+    "parity_b1_k3_dgs_top1_and_err": true,
+    "parity_b1_top1_and_err": true,
+    "pure_q_had_3of3": true,
+    "riccati_rho_damped_lt_0618": true,
+    "s97_double_gs_leak_le_1e6": true,
+    "sass_regs_le_48": true,
+    "sass_zero_stack_spill_ldl_stl": true,
+    "secded_iris_zero_poison": true,
+    "v1_slgb_unmodified": true,
+    "zero_dynamic_alloc_1k": true
+  },
+  "logit_parity": {
+    "b16_k1": {
+      "max_abs_err": 0.00031960010528564453,
+      "mean_abs_err": 1.1482164154585917e-05,
+      "top1_matches": 48,
+      "top1_str": "48/48",
+      "total": 48
+    },
+    "b1_k1": {
+      "max_abs_err": 0.00030422210693359375,
+      "mean_abs_err": 6.365475564962253e-05,
+      "top1_matches": 6,
+      "top1_str": "6/6",
+      "total": 6
+    },
+    "b1_k2_loopcd": {
+      "max_abs_delta_vs_k1": 9.759204864501953,
+      "max_abs_err": 0.0003294944763183594,
+      "mean_abs_err": 7.37128357286565e-05,
+      "top1_matches": 6,
+      "top1_str": "6/6",
+      "total": 6
+    },
+    "b1_k3_dgs": {
+      "max_abs_delta_vs_k1": 25.152164459228516,
+      "max_abs_err": 0.0004901885986328125,
+      "mean_abs_err": 0.00010607203148538247,
+      "top1_matches": 6,
+      "top1_str": "6/6",
+      "total": 6
+    },
+    "loopcd_w_parity": -0.5
+  },
+  "model": "SiliGemma V2",
+  "nvml_energy": {
+    "arms": {
+      "b16_k1_bf16_t128": {
+        "energy_j_per_tok": 0.0915221,
+        "energy_tok_per_j": 10.9263,
+        "energy_wh_run": 0.0268465,
+        "mean_k": 1,
+        "ms": 18.2743,
+        "nvml_avg_power_w": 79.8567,
+        "nvml_hz": 99.9786,
+        "nvml_samples": 121,
+        "peak_temp_c": 73,
+        "toks": 875.546
+      },
+      "b16_k1_g32_t128": {
+        "energy_j_per_tok": 0.0852701,
+        "energy_tok_per_j": 11.7274,
+        "energy_wh_run": 0.033729,
+        "mean_k": 1,
+        "ms": 17.0122,
+        "nvml_avg_power_w": 79.874,
+        "nvml_hz": 99.9867,
+        "nvml_samples": 152,
+        "peak_temp_c": 72,
+        "toks": 940.5
+      },
+      "b16_k2_g32_t128": {
+        "energy_j_per_tok": 0.108393,
+        "energy_tok_per_j": 9.22571,
+        "energy_wh_run": 0.0337222,
+        "mean_k": 2,
+        "ms": 21.5716,
+        "nvml_avg_power_w": 79.8518,
+        "nvml_hz": 99.9794,
+        "nvml_samples": 152,
+        "peak_temp_c": 73,
+        "toks": 741.716
+      },
+      "b1_adaptive_live": {
+        "energy_j_per_tok": 0.620443,
+        "energy_tok_per_j": 1.61175,
+        "energy_wh_run": 0.0332626,
+        "mean_k": 1.64249,
+        "ms": 7.77285,
+        "nvml_avg_power_w": 79.818,
+        "nvml_hz": 99.9845,
+        "nvml_samples": 150,
+        "peak_temp_c": 71,
+        "toks": 128.653
+      },
+      "b1_k1_bf16_t128": {
+        "energy_j_per_tok": 0.644656,
+        "energy_tok_per_j": 1.55122,
+        "energy_wh_run": 0.0268607,
+        "mean_k": 1,
+        "ms": 8.0343,
+        "nvml_avg_power_w": 79.8955,
+        "nvml_hz": 99.9743,
+        "nvml_samples": 121,
+        "peak_temp_c": 69,
+        "toks": 124.466
+      },
+      "b1_k1_g32_t128": {
+        "energy_j_per_tok": 0.531924,
+        "energy_tok_per_j": 1.87997,
+        "energy_wh_run": 0.0336885,
+        "mean_k": 1,
+        "ms": 6.60442,
+        "nvml_avg_power_w": 79.7741,
+        "nvml_hz": 99.9818,
+        "nvml_samples": 152,
+        "peak_temp_c": 68,
+        "toks": 151.414
+      },
+      "b1_k2_g32_t128": {
+        "energy_j_per_tok": 0.673272,
+        "energy_tok_per_j": 1.48528,
+        "energy_wh_run": 0.0334766,
+        "mean_k": 2,
+        "ms": 8.40395,
+        "nvml_avg_power_w": 79.7952,
+        "nvml_hz": 99.9793,
+        "nvml_samples": 151,
+        "peak_temp_c": 70,
+        "toks": 118.992
+      }
+    },
+    "energy_control_tag": "UNCONTROLLED_LAPTOP_NOT_CLAIMED",
+    "energy_disclaimer": "UNCONTROLLED_LAPTOP_NOT_CLAIMED: RTX 3080 Laptop thermal/power cap unconstrained; NVML 100 Hz readings are empirical observations rather than controlled power-efficiency claims."
+  },
+  "pillar1_runtime": {
+    "arena_128k_vram_mib": 2154.83,
+    "b16_k1_bf16_t128_ms": 18.2743,
+    "b16_k1_bf16_t128_toks": 875.546,
+    "b16_k1_g32_t128_ms": 17.0122,
+    "b16_k1_g32_t128_toks": 940.5,
+    "b16_k2_g32_t128_ms": 21.5716,
+    "b16_k2_g32_t128_toks": 741.716,
+    "b1_adaptive_mean_k": 1.64249,
+    "b1_adaptive_ms": 7.77285,
+    "b1_adaptive_tau_cos": 0.303559,
+    "b1_adaptive_tau_sr": 1.00155,
+    "b1_adaptive_toks": 128.653,
+    "b1_k1_bf16_t128_gbps": 260.834,
+    "b1_k1_bf16_t128_ms": 8.0343,
+    "b1_k1_bf16_t128_toks": 124.466,
+    "b1_k1_g32_adv_ms": 6.57318,
+    "b1_k1_g32_adv_toks": 152.133,
+    "b1_k1_g32_t1024_ms": 7.27177,
+    "b1_k1_g32_t1024_toks": 137.518,
+    "b1_k1_g32_t128_gbps": 215.715,
+    "b1_k1_g32_t128_ms": 6.60442,
+    "b1_k1_g32_t128_toks": 151.414,
+    "b1_k2_bf16_t128_ms": 9.81376,
+    "b1_k2_bf16_t128_toks": 101.898,
+    "b1_k2_g32_t128_ms": 8.40395,
+    "b1_k2_g32_t128_toks": 118.992,
+    "b1_k3_g32_t128_ms": 10.1827,
+    "b1_k3_g32_t128_toks": 98.2062,
+    "d2d_stream_bidir_gbps": 357.632,
+    "d2d_stream_copy_gbps": 178.816,
+    "d2d_stream_gbps": 357.632,
+    "device_mem_info_128k_mib": 2334.94,
+    "dynamic_vram_delta_bytes_1k": 0,
+    "exact_128k_alloc_bytes": 2259499660,
+    "exact_128k_alloc_mib": 2154.83,
+    "iris_poisoned": 0,
+    "ple_dma_stall_pct": 0.792681,
+    "provenance_tag": "UNCONTROLLED_LAPTOP_NOT_CLAIMED",
+    "rho_cuda": 0.00206877,
+    "rho_cuda_layer_chain": 0.55015,
+    "secded_ded_cnt": 0,
+    "secded_sec_cnt": 0,
+    "u4_loaded": true,
+    "woodbury_overhead_pct": 2.24238
+  },
+  "pillar2_recurrent": {
+    "adaptive_thresholds": {
+      "tau_cos": 0.30355902910232546,
+      "tau_sr": 1.0015553832054138
+    },
+    "goodfire_guard_dims": [
+      438,
+      1295,
+      221,
+      850
+    ],
+    "goodfire_outlier_dims_top8": [
+      {
+        "absmax": 141.0,
+        "dim": 438
+      },
+      {
+        "absmax": 96.0,
+        "dim": 1295
+      },
+      {
+        "absmax": 84.5,
+        "dim": 221
+      },
+      {
+        "absmax": 67.0,
+        "dim": 850
+      },
+      {
+        "absmax": 65.5,
+        "dim": 195
+      },
+      {
+        "absmax": 49.25,
+        "dim": 1297
+      },
+      {
+        "absmax": 45.75,
+        "dim": 393
+      },
+      {
+        "absmax": 41.5,
+        "dim": 59
+      }
+    ],
+    "heldout_metrics": {
+      "adaptive_k12": {
+        "cd_test_nll": 1.096538377636405,
+        "gsm_test_nll": 2.2224260833229814,
+        "mean_k": 1.4816176470588236,
+        "wt2_test_nll": 5.862485414392808
+      },
+      "k1": {
+        "cd_test_nll": 1.076380407755276,
+        "gsm_test_nll": 2.1174140148698135,
+        "wt2_test_nll": 5.865365540747549
+      },
+      "k2_raw": {
+        "cd_test_nll": 1.5716103492977067,
+        "gsm_test_nll": 2.5901999188334734,
+        "wt2_test_nll": 7.233323056090112
+      },
+      "k2_u4": {
+        "cd_test_nll": 1.5713347436462497,
+        "gsm_test_nll": 2.590425053651938,
+        "wt2_test_nll": 7.233406545601639
+      },
+      "k2_u4_loopcd": {
+        "cd_test_nll": 1.0982383161828997,
+        "gsm_test_nll": 2.0391406161343486,
+        "wt2_test_nll": 5.924604408413756
+      },
+      "k3_dgs_qr": {
+        "cd_test_nll": 2.2610561514413483,
+        "gsm_test_nll": 3.064095099120369,
+        "wt2_test_nll": 7.5606162127326515
+      }
+    },
+    "k3_double_gs_qr": {
+      "dgs_leak_max": 9.685754776000977e-08,
+      "rho_damped_max": 0.3248979151248932,
+      "rho_damped_token_max": 0.73736572265625,
+      "rho_raw_max": 0.7282161712646484,
+      "rho_raw_token_max": 1.643727421760559,
+      "sgs_leak_max": 2.8312206268310547e-07
+    },
+    "paired_stats": {
+      "cd_test_k1_vs_k2_loopcd": {
+        "boot_p": 0.0204,
+        "ci95": [
+          0.003617988499634755,
+          0.039719321092517405
+        ],
+        "mean_baseline": 1.0812972320157566,
+        "mean_candidate": 1.1031816363401143,
+        "mean_delta": 0.02188440432435783,
+        "n": 128,
+        "perm_p": 0.0178982101789821
+      },
+      "gsm_test_k1_vs_k2_loopcd": {
+        "boot_p": 0.0001,
+        "ci95": [
+          -0.1028444166199517,
+          -0.07022525468499863
+        ],
+        "mean_baseline": 2.283104565339639,
+        "mean_candidate": 2.196853812278125,
+        "mean_delta": -0.08625075306151367,
+        "n": 128,
+        "perm_p": 9.999000099990002e-05
+      },
+      "wt2_test_k1_vs_adaptive": {
+        "boot_p": 0.913,
+        "ci95": [
+          -0.022278011546415455,
+          0.01363763248219213
+        ],
+        "mean_baseline": 5.865365540747549,
+        "mean_candidate": 5.862485414392808,
+        "mean_delta": -0.0028801263547411082,
+        "n": 16,
+        "perm_p": 1.0
+      },
+      "wt2_test_k1_vs_k2_loopcd": {
+        "boot_p": 0.0046,
+        "ci95": [
+          0.0162843947317087,
+          0.10221721462174976
+        ],
+        "mean_baseline": 5.865365540747549,
+        "mean_candidate": 5.924604408413757,
+        "mean_delta": 0.05923886766620723,
+        "n": 16,
+        "perm_p": 0.022897710228977103
+      },
+      "wt2_test_k2raw_vs_k2loopcd": {
+        "boot_p": 0.0001,
+        "ci95": [
+          -1.4542990467595118,
+          -1.1656238185658174
+        ],
+        "mean_baseline": 7.2333230560901125,
+        "mean_candidate": 5.924604408413757,
+        "mean_delta": -1.3087186476763557,
+        "n": 16,
+        "perm_p": 9.999000099990002e-05
+      }
+    },
+    "u4_loopcd_cal": {
+      "cal_w_sweep_joint": {
+        "-0.10": 3.1681450655899,
+        "-0.20": 2.9662711166463755,
+        "-0.35": 2.840455973902485,
+        "-0.50": 2.806682322790508,
+        "-0.60": 2.807356422333543,
+        "-0.70": 2.8175874284997766,
+        "-0.80": 2.8370342917450624,
+        "-0.90": 2.862807400200302,
+        "-0.95": 2.8785204116646383,
+        "0.00": 3.5799913294289047
+      },
+      "loopcd_w_opt": -0.5,
+      "u4_alpha_norm": 0.01803036779165268
+    }
+  },
+  "pillar3_hadamard_ablation": {
+    "best_rotation_live": "sloane_had16_3",
+    "live_heldout_eval": {
+      "block_h4": {
+        "cd_test_nll": 1.061626540534141,
+        "gsm_test_nll": 2.1691557089199125,
+        "wt2_test_nll": 5.984970242369409,
+        "wt2_test_ppl": 397.4106950727361
+      },
+      "sloane_had16_3": {
+        "cd_test_nll": 1.0644595671542412,
+        "gsm_test_nll": 2.067665192072096,
+        "wt2_test_nll": 5.6206285813275505,
+        "wt2_test_ppl": 276.06285666492084
+      },
+      "sylvester_h16": {
+        "cd_test_nll": 0.9627687815696963,
+        "gsm_test_nll": 2.1366104254774076,
+        "wt2_test_nll": 5.7580597970999925,
+        "wt2_test_ppl": 316.7332056946658
+      }
+    },
+    "pack_time_s": 0.0,
+    "pareto_15550": {
+      "allocated_bytes": 1282203648,
+      "base_mse_sum": 9.15366897200966e-06,
+      "baseline_bytes": 1282203648,
+      "cap_bytes": 1282203648,
+      "effective_bpw": 4.5,
+      "mse_delta_pct": 0.0,
+      "pareto_mse_sum": 9.15366897200966e-06,
+      "pure_q_exact": true,
+      "schemes": [
+        "3.125bpw_g128",
+        "4.125bpw_g128",
+        "4.500bpw_g32",
+        "16.000bpw_bf16"
+      ],
+      "tensor_counts": {
+        "16.000bpw_bf16": 0,
+        "3.125bpw_g128": 0,
+        "4.125bpw_g128": 0,
+        "4.500bpw_g32": 277,
+        "total": 277
+      },
+      "within_cap": true
+    },
+    "pure_q_orth_checks": "3/3",
+    "repack_scope_note": "Immutable SiliGemma 1.0 archive gemma4_formb_g32.slgb uses pinned Block-H4 wiring; 16x16 runtime FWHT kernels and offline Sylvester/Sloane re-packing are deferred out of V2 scope (best_rot_live=sloane_had16_3, sylvester_beats_all3=True, sloane_beats_all3=False).",
+    "repack_triggered": false,
+    "slgb_deployed_path": "$HOME/hf-releases/staging-siligemma-1.0/gemma4_formb_g32.slgb",
+    "sloane_beats_block_h4_all3": false,
+    "sylvester_beats_block_h4_all3": true,
+    "tensors_evaluated": 277,
+    "weight_277_stats": {
+      "block_h4": {
+        "linf": 0.1123046875,
+        "sqnr_db": 20.405016541887292,
+        "sse": 20865.542662086664
+      },
+      "sloane_had16_3": {
+        "linf": 0.140625,
+        "sqnr_db": 20.49724327688638,
+        "sse": 20427.113906693994
+      },
+      "sylvester_h16": {
+        "linf": 0.124267578125,
+        "sqnr_db": 20.497974011781373,
+        "sse": 20423.677171977935
+      }
+    }
+  },
+  "prereg_sha256": "9d94fee5e38fb2ceadb2584e2ad434665f1d0e1f80c502c0f7698c585cb55b5c",
+  "provenance_tag": "UNCONTROLLED_LAPTOP_NOT_CLAIMED",
+  "sass_ptx_audit": {
+    "kernels": 47,
+    "max_local_bytes": 0,
+    "max_regs": 48,
+    "max_stack_bytes": 0,
+    "sass_ldl_stl": 0,
+    "so_kernels": 47,
+    "so_max_regs": 48
+  },
+  "track": "S187",
+  "upload_authorized": false,
+  "v1_baseline": {
+    "arena_128k_vram_mib": 2194.94,
+    "b16_k1_ms": 18.1108,
+    "b16_k1_toks": 883.449,
+    "b16_k2_ms": 22.5597,
+    "b16_k2_toks": 709.228,
+    "b1_k1_ms": 7.34131,
+    "b1_k1_toks": 136.215,
+    "b1_k2_ms": 9.27309,
+    "b1_k2_toks": 107.839
+  },
+  "v1_slgb_bytes": 2094062080,
+  "v1_slgb_sha256": "111a672f1d52ba835b67e08daf1ab12de950ee3f909d6c7906c7292d22e48929",
+  "verdict": "PASS"
+}

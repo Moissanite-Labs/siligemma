@@ -10,10 +10,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <dlfcn.h>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -103,25 +108,27 @@ static constexpr uint64_t CANARY_TELEMETRY_BYTES     = 65536ULL;     // P8 64 Ki
 // 2. IRIS + [16, 11, 4] 64-Byte Telemetry Canary & Watchdog ABI
 // ----------------------------------------------------------------------------
 
+// Unified IRIS + Hamming(72,64) / [16, 11, 4] 64-Byte Telemetry Canary & Watchdog ABI
 struct alignas(64) HoloSphereRazorCanary64 {
-    uint32_t sec_count_u32;            // [0..3]   Tier-1 1-bit LSB SEC count
-    uint32_t ded_count_u32;            // [4..7]   Tier-2 2-bit LSB DED / IRIS mismatch count
-    uint32_t epoch_u32;                // [8..11]  Monotonic token/graph epoch
-    uint32_t rollback_token_u32;       // [12..15] Last verified clean token step
-    uint32_t non_lsb_canary_u32;       // [16..19] Upper-bit / structural anomaly canary
-    uint32_t last_syndrome_u32;        // [20..23] Hi16 = rolling IRIS CRC; Lo16 = SECDED syndrome
-    uint32_t ewma_ber_q16_u32;         // [24..27] Q16 EWMA bit-error rate
-    uint32_t clean_streak_u32;         // [28..31] Consecutive clean epochs
-    uint32_t hold_remaining_u32;       // [32..35] Min-dwell hold epochs
-    uint32_t ded_latch_remaining_u32;  // [36..39] DED recovery latch epochs
-    uint32_t iris_runtime_crc_u32;     // [40..43] Full 32-bit rolling IRIS runtime state CRC
+    uint64_t iris_state;               // [0..7]   Rolling 64-bit IRIS digest
+    uint64_t checksum;                 // [8..15]  iris_state ^ uint64_t(poisoned)
+    uint32_t sec_cnt;                  // [16..19] Tier-1 1-bit SEC healed count (non-fatal)
+    uint32_t ded_cnt;                  // [20..23] Tier-2 2-bit DED fatal count
+    uint32_t poisoned;                 // [24..27] Fatal poison flag (DED / IRIS ONLY, never SEC!)
+    uint32_t step_ctr;                 // [28..31] Monotonic token/graph epoch
+    uint32_t u4_passes;                // [32..35] Active U-4 loop passes
+    uint32_t wb_applied;               // [36..39] Woodbury hub apply counter
+    uint32_t iris_runtime_crc_u32;     // [40..43] Full 32-bit folded IRIS runtime state CRC
     uint32_t iris_mismatch_count_u32;  // [44..47] Runtime trace mismatch counter
-    uint32_t reserved_u32[4];          // [48..63] Reserved zero padding
+    uint32_t last_syndrome_u32;        // [48..51] Last SECDED syndrome observed
+    uint32_t reserved_u32[3];          // [52..63] Reserved zero padding
 };
 static_assert(sizeof(HoloSphereRazorCanary64) == 64u, "HoloSphereRazorCanary64 must be 64 B");
-static_assert(offsetof(HoloSphereRazorCanary64, sec_count_u32) == 0u, "sec_count offset");
-static_assert(offsetof(HoloSphereRazorCanary64, ded_count_u32) == 4u, "ded_count offset");
-static_assert(offsetof(HoloSphereRazorCanary64, last_syndrome_u32) == 20u, "last_syndrome offset");
+static_assert(offsetof(HoloSphereRazorCanary64, iris_state) == 0u, "iris_state offset");
+static_assert(offsetof(HoloSphereRazorCanary64, checksum) == 8u, "checksum offset");
+static_assert(offsetof(HoloSphereRazorCanary64, sec_cnt) == 16u, "sec_cnt offset");
+static_assert(offsetof(HoloSphereRazorCanary64, ded_cnt) == 20u, "ded_cnt offset");
+static_assert(offsetof(HoloSphereRazorCanary64, poisoned) == 24u, "poisoned offset");
 static_assert(offsetof(HoloSphereRazorCanary64, iris_runtime_crc_u32) == 40u, "iris_crc offset");
 
 enum class WatchdogAction : uint32_t {
@@ -291,9 +298,10 @@ struct SiliGemmaArenaLayout {
     uint64_t p7_used_bytes;
 };
 
-constexpr SiliGemmaArenaLayout compute_siligemma_arena_layout(
+constexpr SiliGemmaArenaLayout compute_siligemma_arena_layout_v2(
     uint32_t t_max,
     uint32_t group_size,
+    bool with_embed_bf16,
     bool with_lm_head_shadow
 ) noexcept {
     SiliGemmaArenaLayout lay{};
@@ -308,9 +316,9 @@ constexpr SiliGemmaArenaLayout compute_siligemma_arena_layout(
     lay.sz_p1_wire_weights = (group_size == 128u) ? WIRE_BYTES_G128_4125BPW : WIRE_BYTES_G32_45BPW;
     cur = align_up_n(cur + lay.sz_p1_wire_weights, 256ULL);
 
-    // Partition 2: Tied BF16 embed_tokens + optional 4.5 bpw lm_head shadow
+    // Partition 2: Tied BF16 embed_tokens + optional 4.5 bpw lm_head/embed shadow
     lay.off_p2_embed_bf16 = cur;
-    lay.sz_p2_embed_bf16 = EMBED_TOKENS_BF16_BYTES;
+    lay.sz_p2_embed_bf16 = with_embed_bf16 ? EMBED_TOKENS_BF16_BYTES : 0ULL;
     cur = align_up_n(cur + lay.sz_p2_embed_bf16, 256ULL);
 
     lay.off_p2_lm_shadow = cur;
@@ -383,10 +391,20 @@ constexpr SiliGemmaArenaLayout compute_siligemma_arena_layout(
     return lay;
 }
 
+constexpr SiliGemmaArenaLayout compute_siligemma_arena_layout(
+    uint32_t t_max,
+    uint32_t group_size,
+    bool with_lm_head_shadow
+) noexcept {
+    return compute_siligemma_arena_layout_v2(t_max, group_size, true, with_lm_head_shadow);
+}
+
 // Compile-time verification against pinned arena exact byte budgets
 static constexpr SiliGemmaArenaLayout kArena16K = compute_siligemma_arena_layout(16384u, 32u, false);
 static constexpr SiliGemmaArenaLayout kArena64KShadow = compute_siligemma_arena_layout(65536u, 32u, true);
 static constexpr SiliGemmaArenaLayout kArena128K = compute_siligemma_arena_layout(131072u, 32u, false);
+static constexpr SiliGemmaArenaLayout kArena128K_FormB_G32 = compute_siligemma_arena_layout_v2(131072u, 32u, false, true);
+static constexpr uint64_t WEIGHT_ECC72_BYTES = 142467072ULL; // 71,233,536 g32 uint4 groups * 2 B Hamming(72,64) ECC
 
 static_assert(kArena16K.sz_p5_zed_kv_ring == 106954752ULL, "T=16384 KV ring bytes must equal PREREG");
 static_assert(kArena64KShadow.sz_p5_zed_kv_ring == 408944640ULL, "T=65536 KV ring bytes must equal PREREG");
@@ -394,7 +412,9 @@ static_assert(kArena128K.sz_p5_zed_kv_ring == 811597824ULL, "T=131072 KV ring by
 static_assert(kArena16K.p7_used_bytes <= kArena16K.sz_p7_act_scratch, "P7 workspace must fit in 20,217,856 B");
 static_assert(kArena16K.total_arena_bytes == 1995364608ULL, "16K arena must match PREREG exact byte count");
 static_assert(kArena64KShadow.total_arena_bytes == 2523846912ULL, "64K+shadow arena must match PREREG exact byte count");
-static_assert(kArena128K.total_arena_bytes == 2700007680ULL, "128K arena must match PREREG exact byte count");
+static_assert(kArena128K.total_arena_bytes == 2700007680ULL, "128K BF16-embed arena must match exact byte count");
+static_assert(kArena128K_FormB_G32.total_arena_bytes == 2121193728ULL, "128K Form-B 4.5bpw arena must equal 2022.93 MiB");
+static_assert(kArena128K_FormB_G32.total_arena_bytes + WEIGHT_ECC72_BYTES == 2263660800ULL, "128K Form-B + Hamming(72,64) ECC <= 2457.6 MiB");
 
 // ----------------------------------------------------------------------------
 // 4. Zero-Anchor Descriptor Builder & Fail-Closed Validation
@@ -753,13 +773,20 @@ inline size_t next_power_of_two(size_t n) noexcept {
     return p;
 }
 
-// 0-ULP Fixed-Shape 7-Stage Binary Reduction Tree (matches tree_reduce_128_sm86 bit-for-bit)
+// 0-ULP Fixed-Shape 4-Warp XOR Butterfly + Sum Reduction (matches tree_reduce_128_sm86 bit-for-bit)
 inline float tree_reduce_128_cpu(std::array<float, 128>& tile) noexcept {
-    for (size_t half = 64u; half >= 1u; half >>= 1u) {
-        for (size_t t = 0u; t < half; ++t) {
-            tile[t] = tile[t] + tile[t + half];
+    float warps[4];
+    for (int w = 0; w < 4; ++w) {
+        float lane[32];
+        for (int i = 0; i < 32; ++i) lane[i] = tile[static_cast<size_t>(w * 32 + i)];
+        for (int stride = 1; stride <= 16; stride <<= 1) {
+            float nxt[32];
+            for (int i = 0; i < 32; ++i) nxt[i] = lane[i] + lane[i ^ stride];
+            for (int i = 0; i < 32; ++i) lane[i] = nxt[i];
         }
+        warps[w] = lane[0];
     }
+    tile[0] = (warps[0] + warps[1]) + (warps[2] + warps[3]);
     return tile[0];
 }
 
@@ -983,12 +1010,58 @@ inline ValidationError evaluate_riccati_loop_guard(
     return ValidationError::OK;
 }
 
+inline uint8_t secded72_encode_cpu(uint64_t w64) noexcept {
+    const uint32_t w0 = static_cast<uint32_t>(w64);
+    const uint32_t w1 = static_cast<uint32_t>(w64 >> 32);
+    static constexpr uint32_t kLo[7] = {
+        0x56aaad5bu, 0x9b33366du, 0xe3c3c78eu, 0x03fc07f0u, 0x03fff800u, 0xfc000000u, 0x00000000u
+    };
+    static constexpr uint32_t kHi[7] = {
+        0xab555555u, 0xcd999999u, 0xf1e1e1e1u, 0x01fe01feu, 0x01fffe00u, 0x01ffffffu, 0xfe000000u
+    };
+    uint32_t p7 = 0u;
+    for (int k = 0; k < 7; ++k) {
+        const uint32_t pk = static_cast<uint32_t>(__builtin_popcount(w0 & kLo[k]) + __builtin_popcount(w1 & kHi[k])) & 1u;
+        p7 |= (pk << k);
+    }
+    const uint32_t pall = static_cast<uint32_t>(__builtin_popcount(w0) + __builtin_popcount(w1) + __builtin_popcount(p7)) & 1u;
+    return static_cast<uint8_t>(p7 | (pall << 7));
+}
+
+// Returns 0=clean, 1=SEC healed in-place, 2=DED uncorrectable
+inline int secded72_decode_heal_cpu(uint64_t& w64, uint8_t ecc8) noexcept {
+    const uint32_t w0 = static_cast<uint32_t>(w64);
+    const uint32_t w1 = static_cast<uint32_t>(w64 >> 32);
+    static constexpr uint32_t kLo[7] = {
+        0x56aaad5bu, 0x9b33366du, 0xe3c3c78eu, 0x03fc07f0u, 0x03fff800u, 0xfc000000u, 0x00000000u
+    };
+    static constexpr uint32_t kHi[7] = {
+        0xab555555u, 0xcd999999u, 0xf1e1e1e1u, 0x01fe01feu, 0x01fffe00u, 0x01ffffffu, 0xfe000000u
+    };
+    uint32_t syn = static_cast<uint32_t>(ecc8 & 0x7Fu);
+    for (int k = 0; k < 7; ++k) {
+        const uint32_t pk = static_cast<uint32_t>(__builtin_popcount(w0 & kLo[k]) + __builtin_popcount(w1 & kHi[k])) & 1u;
+        syn ^= (pk << k);
+    }
+    const uint32_t perr = static_cast<uint32_t>(__builtin_popcount(w0) + __builtin_popcount(w1) + __builtin_popcount(ecc8)) & 1u;
+    if (syn == 0u && perr == 0u) return 0;
+    if (perr == 1u) {
+        if (syn == 0u || (syn & (syn - 1u)) == 0u) return 1;
+        if (syn > 71u) return 2;
+        const uint32_t p2_le = 32u - static_cast<uint32_t>(__builtin_clz(syn));
+        const uint32_t bit = syn - 1u - p2_le;
+        w64 ^= (1ULL << bit);
+        return 1;
+    }
+    return 2;
+}
+
 inline WatchdogAction evaluate_canary_watchdog(
     const HoloSphereRazorCanary64& canary,
     uint32_t expected_iris_crc,
     bool check_iris
 ) noexcept {
-    if (canary.ded_count_u32 > 0u) return WatchdogAction::SAFE_HALT_DED_ROLLBACK;
+    if (canary.ded_cnt > 0u || canary.poisoned != 0u) return WatchdogAction::SAFE_HALT_DED_ROLLBACK;
     if (check_iris && canary.iris_runtime_crc_u32 != expected_iris_crc) {
         return WatchdogAction::SAFE_HALT_DED_ROLLBACK;
     }
@@ -1000,6 +1073,10 @@ inline WatchdogAction evaluate_canary_watchdog(
 
 
 namespace s184b {
+
+using siligemma::HoloSphereRazorCanary64;
+using siligemma::WatchdogAction;
+using siligemma::evaluate_canary_watchdog;
 
 // Core model geometry (google/gemma-4-E2B-it text decoder)
 constexpr uint32_t SLGB_MAGIC = 0x534C4734u; // "SLG4"
@@ -1035,11 +1112,12 @@ constexpr uint64_t WIRE_BYTES_LM_HEAD_BF16 = 805306368ULL;
 // Preserved Static Arena Partitions (bytes)
 constexpr uint64_t kArena16K = 1995364608ULL;
 constexpr uint64_t kArena64KShadow = 2523846912ULL;  // P5 KV = 408,944,640 B (fits FP32 KV up to B=16 T=1024 = 402,653,184 B!)
-constexpr uint64_t kArena128K = 2700007680ULL;       // BF16 KV = 811,597,824 B -> 2744.94 MiB <= 3072 MiB!
+constexpr uint64_t kArena128K = 2700007680ULL;       // BF16-embed 128K layout = 2574.93 MiB (2,700,007,680 B)
+constexpr uint64_t kArena128KFormBG32 = 2121193728ULL; // Form-B 4.5bpw 128K layout = 2022.93 MiB (+135.87 MiB ECC72 = 2158.80 MiB <= 2457.6 MiB)
 constexpr uint64_t ARENA_P5_SHADOW_BYTES = 408944640ULL;
 constexpr uint64_t ARENA_P5_128K_BF16_BYTES = 811597824ULL;
 constexpr uint64_t ARENA_P7_SCRATCH_BYTES = 20217856ULL;
-constexpr uint64_t MAX_128K_VRAM_MIB = 3072ULL;
+constexpr double   MAX_128K_VRAM_MIB = 2457.6;
 
 // U-4 Loop Controller & Woodbury Hub Steering Constants
 constexpr int U4_LOOP_START = 25;
@@ -1048,20 +1126,6 @@ constexpr int U4_RANK = 16;
 constexpr int WOODBURY_RANK = 8;
 constexpr int WOODBURY_HUB_START = 10;
 constexpr int WOODBURY_HUB_END = 14;     // L10..L14 20x shared_KV hub
-
-// Exact 64-byte Hardware Canary Struct (IRIS + Hamming(16,11) SECDED)
-struct alignas(64) HoloSphereRazorCanary64 {
-    uint64_t iris_state;
-    uint32_t sec_cnt;
-    uint32_t ded_cnt;
-    uint32_t poisoned;
-    uint32_t step_ctr;
-    uint32_t u4_passes;
-    uint32_t wb_applied;
-    uint64_t checksum;
-    uint64_t reserved[3];
-};
-static_assert(sizeof(HoloSphereRazorCanary64) == 64, "Canary must stay 64 bytes");
 
 enum LinearId : uint32_t {
     LIN_Q = 0,
@@ -1077,16 +1141,16 @@ enum LinearId : uint32_t {
     LIN_LM_HEAD_G32 = 10
 };
 
-struct SiliGemmaLinearDesc {
+struct SlgbRuntimeLinearDesc {
     uint32_t layer_idx;
     uint32_t kind;
     uint32_t out_features;
     uint32_t in_features;
     uint64_t offset_u4;   // element offset (uint4) into bulk packed weights
-    uint64_t offset_sc;   // element offset (__half) into bulk scales
+    uint64_t offset_sc;   // element offset (__half / uint32_t sc+ecc) into bulk scales
 };
 
-struct SiliGemmaLayerDesc {
+struct SlgbRuntimeLayerDesc {
     uint32_t layer_idx;
     uint32_t is_full_attn;
     uint32_t is_kv_shared;
@@ -1113,10 +1177,10 @@ struct SiliGemmaLayerDesc {
     uint32_t lin_ple_proj;
     uint32_t pad_;
 };
-static_assert(sizeof(SiliGemmaLinearDesc) == 32, "SiliGemmaLinearDesc must stay 32 bytes");
-static_assert(sizeof(SiliGemmaLayerDesc) == 128, "SiliGemmaLayerDesc must stay 128 bytes");
+static_assert(sizeof(SlgbRuntimeLinearDesc) == 32, "SlgbRuntimeLinearDesc must stay 32 bytes");
+static_assert(sizeof(SlgbRuntimeLayerDesc) == 128, "SlgbRuntimeLayerDesc must stay 128 bytes");
 
-struct SlgbHeader {
+struct SlgbRuntimeHeader {
     uint32_t magic;
     uint32_t version;
     uint32_t num_layers;
@@ -1138,25 +1202,13 @@ struct SlgbHeader {
     float ple_input_scale;
     float softcap;
 };
-static_assert(sizeof(SlgbHeader) == 96, "SlgbHeader must stay 96 bytes");
+static_assert(sizeof(SlgbRuntimeHeader) == 96, "SlgbRuntimeHeader must stay 96 bytes");
 
 // Exact canonical 128-lane tree reduction matching CUDA `tree_reduce_128_sm86` to 0-ULP!
 inline float canonical_tree_reduce_128_cpu(const float* xs) {
-    float cur[128];
-    for (int i = 0; i < 128; ++i) cur[i] = xs[i];
-    // Warp 5-stage butterfly xor reductions (masks 1, 2, 4, 8, 16)
-    float warps[4];
-    for (int w = 0; w < 4; ++w) {
-        float lane[32];
-        for (int i = 0; i < 32; ++i) lane[i] = cur[w * 32 + i];
-        for (int stride = 1; stride <= 16; stride <<= 1) {
-            float nxt[32];
-            for (int i = 0; i < 32; ++i) nxt[i] = lane[i] + lane[i ^ stride];
-            for (int i = 0; i < 32; ++i) lane[i] = nxt[i];
-        }
-        warps[w] = lane[0];
-    }
-    return (warps[0] + warps[1]) + (warps[2] + warps[3]);
+    std::array<float, 128> tile{};
+    for (int i = 0; i < 128; ++i) tile[static_cast<size_t>(i)] = xs[i];
+    return siligemma::tree_reduce_128_cpu(tile);
 }
 
 // Exact CPU Hamming(16,11) SECDED syndrome check matching device `secded_syn`!
@@ -1259,6 +1311,220 @@ inline void fwht4_cpu(float* x, int n) {
         x[i + 3] = (a1 - a3) * 0.5f;
     }
 }
+
+// ---------------------------------------------------------------------------
+// SiliGemma V2 Pillar 2 & Telemetry Additions (Goodfire, LoopCD, Double-GS, NVML)
+// ---------------------------------------------------------------------------
+
+static constexpr int GOODFIRE_OUTLIER_COUNT = 4;
+static constexpr std::array<int32_t, 4> GOODFIRE_OUTLIER_DIMS = {438, 1295, 221, 850};
+static constexpr double S97_ORTH_LEAK_LIMIT = 1.0e-6;
+static constexpr double V2_B1_K1_TARGET_TOKS = 150.0;
+static constexpr double V2_B16_K1_TARGET_TOKS = 870.0;
+
+inline bool is_goodfire_outlier_dim(int d) {
+    for (int i = 0; i < GOODFIRE_OUTLIER_COUNT; ++i) {
+        if (GOODFIRE_OUTLIER_DIMS[static_cast<size_t>(i)] == d) return true;
+    }
+    return false;
+}
+
+inline void loopcd_hidden_extrap_cpu(float* h_r, const float* h_b, float w, int D) {
+    for (int d = 0; d < D; ++d) {
+        if (!is_goodfire_outlier_dim(d)) {
+            h_r[d] = h_r[d] + w * (h_r[d] - h_b[d]);
+        }
+    }
+}
+
+inline void p233c_clean_halt_metrics_cpu(
+    const float* h_1, const float* h_2, int D, float& out_sr_clean, float& out_cos_clean
+) {
+    double n1 = 0.0, n2 = 0.0, nd = 0.0, dot = 0.0;
+    for (int d = 0; d < D; ++d) {
+        if (is_goodfire_outlier_dim(d)) continue;
+        const double a = static_cast<double>(h_1[d]);
+        const double b = static_cast<double>(h_2[d]);
+        const double diff = b - a;
+        n1 += a * a;
+        n2 += b * b;
+        nd += diff * diff;
+        dot += a * b;
+    }
+    out_sr_clean = static_cast<float>(std::sqrt(nd / std::max(n1, 1.0e-12)));
+    out_cos_clean = static_cast<float>(dot / std::sqrt(std::max(n1 * n2, 1.0e-24)));
+}
+
+// Double Gram-Schmidt orthogonal projection out of Q_keep [r_keep x D] (orthonormal rows)
+inline void double_gs_project_cpu(
+    const float* z_in, const float* q_keep_rows, int r_keep, int D, float* z_out, double* out_leak_after_1 = nullptr, double* out_leak_after_2 = nullptr
+) {
+    std::vector<double> buf(static_cast<size_t>(D));
+    for (int d = 0; d < D; ++d) buf[static_cast<size_t>(d)] = static_cast<double>(z_in[d]);
+
+    auto run_pass = [&]() {
+        std::vector<double> coeff(static_cast<size_t>(r_keep), 0.0);
+        for (int r = 0; r < r_keep; ++r) {
+            const float* q = q_keep_rows + static_cast<size_t>(r) * D;
+            double s = 0.0;
+            for (int d = 0; d < D; ++d) s += buf[static_cast<size_t>(d)] * static_cast<double>(q[d]);
+            coeff[static_cast<size_t>(r)] = s;
+        }
+        for (int r = 0; r < r_keep; ++r) {
+            const float* q = q_keep_rows + static_cast<size_t>(r) * D;
+            const double c = coeff[static_cast<size_t>(r)];
+            for (int d = 0; d < D; ++d) buf[static_cast<size_t>(d)] -= c * static_cast<double>(q[d]);
+        }
+    };
+
+    auto measure_leak = [&]() -> double {
+        double zn = 0.0, pn = 0.0;
+        for (int d = 0; d < D; ++d) zn += buf[static_cast<size_t>(d)] * buf[static_cast<size_t>(d)];
+        for (int r = 0; r < r_keep; ++r) {
+            const float* q = q_keep_rows + static_cast<size_t>(r) * D;
+            double s = 0.0;
+            for (int d = 0; d < D; ++d) s += buf[static_cast<size_t>(d)] * static_cast<double>(q[d]);
+            pn += s * s;
+        }
+        return std::sqrt(pn / std::max(zn, 1.0e-24));
+    };
+
+    run_pass();
+    if (out_leak_after_1) *out_leak_after_1 = measure_leak();
+    run_pass();
+    if (out_leak_after_2) *out_leak_after_2 = measure_leak();
+    for (int d = 0; d < D; ++d) z_out[d] = static_cast<float>(buf[static_cast<size_t>(d)]);
+}
+
+struct NvmlSampleWindow {
+    bool valid = false;
+    double avg_power_w = 0.0;
+    double peak_temp_c = 0.0;
+    double duration_s = 0.0;
+    double energy_wh = 0.0;
+    double energy_j = 0.0;
+    double effective_hz = 0.0;
+    uint32_t sample_count = 0u;
+};
+
+class NvmlSampler100Hz {
+public:
+    NvmlSampler100Hz() = default;
+    ~NvmlSampler100Hz() { shutdown(); }
+
+    bool init(int gpu_index = 0) {
+        if (ready_) return true;
+        handle_ = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+        if (!handle_) return false;
+        using InitFn = int (*)();
+        using ShutFn = int (*)();
+        using DevFn = int (*)(unsigned int, void**);
+        using PowFn = int (*)(void*, unsigned int*);
+        using TmpFn = int (*)(void*, int, unsigned int*);
+        fn_init_ = reinterpret_cast<InitFn>(dlsym(handle_, "nvmlInit_v2"));
+        fn_shut_ = reinterpret_cast<ShutFn>(dlsym(handle_, "nvmlShutdown"));
+        fn_dev_ = reinterpret_cast<DevFn>(dlsym(handle_, "nvmlDeviceGetHandleByIndex_v2"));
+        fn_pow_ = reinterpret_cast<PowFn>(dlsym(handle_, "nvmlDeviceGetPowerUsage"));
+        fn_tmp_ = reinterpret_cast<TmpFn>(dlsym(handle_, "nvmlDeviceGetTemperature"));
+        if (!fn_init_ || !fn_dev_ || !fn_pow_ || !fn_tmp_) return false;
+        if (fn_init_() != 0) return false;
+        if (fn_dev_(static_cast<unsigned int>(gpu_index), &dev_) != 0 || !dev_) return false;
+        ready_ = true;
+        return true;
+    }
+
+    bool start() {
+        if (!ready_ || worker_.joinable()) return false;
+        stop_flag_.store(false, std::memory_order_release);
+        samples_t_mw_.clear();
+        peak_c_ = 0.0;
+        t0_ = std::chrono::steady_clock::now();
+        worker_ = std::thread([this]() {
+            auto next_tick = t0_;
+            while (!stop_flag_.load(std::memory_order_acquire)) {
+                unsigned int mw = 0, tc = 0;
+                const auto now = std::chrono::steady_clock::now();
+                const double t_s = std::chrono::duration<double>(now - t0_).count();
+                if (fn_pow_(dev_, &mw) == 0 && mw > 0) {
+                    samples_t_mw_.emplace_back(t_s, mw);
+                }
+                if (fn_tmp_(dev_, 0, &tc) == 0) {
+                    peak_c_ = std::max(peak_c_, static_cast<double>(tc));
+                }
+                next_tick += std::chrono::milliseconds(10);
+                const auto after = std::chrono::steady_clock::now();
+                if (next_tick <= after) {
+                    next_tick = after + std::chrono::milliseconds(10);
+                }
+                std::this_thread::sleep_until(next_tick);
+            }
+        });
+        return true;
+    }
+
+    NvmlSampleWindow stop() {
+        NvmlSampleWindow out{};
+        if (!ready_) return out;
+        stop_flag_.store(true, std::memory_order_release);
+        if (worker_.joinable()) worker_.join();
+        const auto t1 = std::chrono::steady_clock::now();
+        out.duration_s = std::chrono::duration<double>(t1 - t0_).count();
+        if (samples_t_mw_.empty() || out.duration_s <= 0.0) return out;
+        out.sample_count = static_cast<uint32_t>(samples_t_mw_.size());
+        out.effective_hz = static_cast<double>(out.sample_count) / out.duration_s;
+        out.peak_temp_c = peak_c_;
+        if (samples_t_mw_.size() >= 2u) {
+            double e_j = 0.0;
+            const double first_w = static_cast<double>(samples_t_mw_.front().second) * 1.0e-3;
+            const double last_w = static_cast<double>(samples_t_mw_.back().second) * 1.0e-3;
+            if (samples_t_mw_.front().first > 0.0) {
+                e_j += first_w * samples_t_mw_.front().first;
+            }
+            for (size_t i = 1u; i < samples_t_mw_.size(); ++i) {
+                const double dt = std::max(0.0, samples_t_mw_[i].first - samples_t_mw_[i - 1u].first);
+                const double p0 = static_cast<double>(samples_t_mw_[i - 1u].second) * 1.0e-3;
+                const double p1 = static_cast<double>(samples_t_mw_[i].second) * 1.0e-3;
+                e_j += 0.5 * (p0 + p1) * dt;
+            }
+            if (out.duration_s > samples_t_mw_.back().first) {
+                e_j += last_w * (out.duration_s - samples_t_mw_.back().first);
+            }
+            out.energy_j = e_j;
+            out.avg_power_w = e_j / out.duration_s;
+        } else {
+            out.avg_power_w = static_cast<double>(samples_t_mw_[0].second) * 1.0e-3;
+            out.energy_j = out.avg_power_w * out.duration_s;
+        }
+        out.energy_wh = out.energy_j / 3600.0;
+        out.valid = (out.sample_count >= 10u);
+        return out;
+    }
+
+    void shutdown() {
+        if (worker_.joinable()) {
+            stop_flag_.store(true, std::memory_order_release);
+            worker_.join();
+        }
+        if (ready_ && fn_shut_) fn_shut_();
+        if (handle_) { dlclose(handle_); handle_ = nullptr; }
+        ready_ = false;
+    }
+
+private:
+    void* handle_ = nullptr;
+    void* dev_ = nullptr;
+    int (*fn_init_)() = nullptr;
+    int (*fn_shut_)() = nullptr;
+    int (*fn_dev_)(unsigned int, void**) = nullptr;
+    int (*fn_pow_)(void*, unsigned int*) = nullptr;
+    int (*fn_tmp_)(void*, int, unsigned int*) = nullptr;
+    bool ready_ = false;
+    std::atomic<bool> stop_flag_{false};
+    std::thread worker_;
+    std::vector<std::pair<double, unsigned int>> samples_t_mw_;
+    double peak_c_ = 0.0;
+    std::chrono::steady_clock::time_point t0_{};
+};
 
 } // namespace s184b
 
