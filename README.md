@@ -3,55 +3,51 @@
 **SiliGemma** is the bare-metal Ampere `sm_86` (`Form B`) inference engine, `[16, 11, 4]` Extended Hamming SECDED lattice toolkit, and zero-backprop adaptation suite for [`google/gemma-4-E2B-it`](https://huggingface.co/google/gemma-4-E2B-it).
 
 - **GitHub Repository:** [`Moissanite-Labs/siligemma`](https://github.com/Moissanite-Labs/siligemma)
+- **Flagship Hugging Face Release (`SiliGemma 1.0`, Stage-2 `33`-Kernel):** [`ahrazzle/SiliGemma-1.0`](https://huggingface.co/ahrazzle/SiliGemma-1.0) · [**`SiliQuant Flagships`**](https://huggingface.co/collections/ahrazzle/siliquant-flagships-6b09fd348ec8b911eb469008)
 - **Form A Hugging Face Model (Standard-Stack Drop-In):** [`ahrazzle/SiliGemma-4-E2B-FormA`](https://huggingface.co/ahrazzle/SiliGemma-4-E2B-FormA)
-- **Form B Hugging Face Model (Anchor-Free Bare-Metal `sm_86`):** [`ahrazzle/SiliGemma-4-E2B-FormB-Native`](https://huggingface.co/ahrazzle/SiliGemma-4-E2B-FormB-Native)
+- **Form B Hugging Face Model (Stage-1 Baseline):** [`ahrazzle/SiliGemma-4-E2B-FormB-Native`](https://huggingface.co/ahrazzle/SiliGemma-4-E2B-FormB-Native)
 - **License:** Apache License 2.0 (inherited from `google/gemma-4-E2B-it`; see [`LICENSE`](LICENSE) and [`NOTICE_UPSTREAM_LICENSE.txt`](NOTICE_UPSTREAM_LICENSE.txt))
 
 ---
 
-## Core Architectural Breakthroughs (`Track S182b3/b4` & `Track S184`)
+## Core Architectural Breakthroughs (`Stage-2` `SiliGemma 1.0` & `Track S184 / S184b`)
 
-1. **Zero-Anchor Bare-Metal C++20/CUDA `sm_86` Engine (`kernels/`):**
-   - `siligemma_bench_sm86` links strictly standard system libraries (`libc`, `libstdc++`, `libm`, `libgcc_s`) with **zero Python, PyTorch, `transformers`, `cuBLAS`, or Form-A CSR dependencies**.
-   - `20/20` compiled `sm_86` kernels enforce **`<= 48` registers**, **`0 B` stack**, **`0 B` spill loads/stores**, and **`0` `LDL`/`STL`** SASS instructions.
-   - `tree_reduce_128_sm86` achieves **`0`-ULP** bit-identical binary reduction across CPU/GPU; `[16, 11, 4]` `1-LOP3 + 5-POPC` `SECDED` protects the `A_16` LSB parity plane (`0x11111111`; bits 1–3 carry quotient indices without ECC), and `HoloSphereRazorCanary64` + `IRIS` passed **`3/3` LSB SEC repairs**, **`3/3` LSB DED traps**, and **`1/1` IRIS Trojan traps** in `run_selftest_gpu`.
-2. **Exact Topology & `bos=2` Tokenizer Fix:**
-   - Enforces `bos_token_id = 2` fail-closed in `.slgb` headers and token buffers (`Gemma4Tokenizer` omission caused `WT2_test[0]` to collapse from `4.6484 -> 11.1014` nats in Form A and `4.6075 -> 11.2901` in Form B).
-   - Quantizes all `276` live 2D text linears (`1,055,711,232 B` @ `4.5 bpw g=32`), physically omits **`60` dead `L15..34` `(k_proj, v_proj, k_norm)` tensors** (`18,880,512` params), packs `262` FP32 norm/scalar vectors (`285,987` params) + IEEE CRC-32 verified `.slgb` headers (`2,094,062,080 B`), allocates **`0 B` dynamic VRAM/heap** over `1,000` decode steps (`2,744.94 MiB` = **`2.68 GiB`** @ `128K` ctx), and overlaps `17,920 B/tok` pinned host-DMA PLE with **`+0.01%` stall**.
-3. **Hoisted `256 B` Woodbury & `L10..L14` `20x` `shared_KV` Hub Steering:**
-   - Single-update `c_wb_inv_256b` constant-memory `8x8` Cayley–Woodbury steering preserves row norms (`3.67e-9` drift) at `+13.11%` AB/BA overhead (`D=1536`); steering `L10..L14` added `+0.19%` end-to-end latency (`11.180 -> 11.201 ms`), `1.308e-9` CUDA norm drift, `WT2_test -0.0380` nats, and `0` KV writes in `L15..34`.
-4. **`KG-GFB4 PASS` — `0 B`-KV `L25..L33` `K=2` (`44L`) Recurrent Loop (`T_{Inkling2 -> Gemma4}`):**
-   - Looping `L25..L33` with `2,695,680` (`5.14 MiB`) `r=16` `BF16` `(q, mlp, ple)` controllers reserves **`0 B` extra KV cache** (`K=1` zero-init diff = `0.0`), contracts with **`rho_hat = 0.1062` CUDA / `0.1228` Torch** (`<< 0.6180`), and lifts held-out accuracy across all 3 benchmarks (`K=1 -> K=2`) in `Track S184`'s calibrated Torch/CUDA evaluation (`docs/STAGE1_VERDICT.json`; note: the shipped standalone `.slgb` release initializes the `U-4` slot to `K=1` identity `wf=0, wg=0, mq=0` — mathematically `h_out = h_in` — and the C++ bench executes segment re-execution / WT2 timing without an in-binary CD/GSM eval loop):
-     - **`WT2_test` (`16x256`):** Torch `5.410329 -> 5.202459` (`-0.207870` nats); CUDA `5.412680 -> 5.205190`
-     - **`Countdown_test` (`128`):** `1.376065 -> 1.195397` (**`+0.180667` nats**, 95% CI `[+0.1638, +0.1973]`, `p=9.999e-5`)
-     - **`GSM8K_OOD` (`64`):** `1.779174 -> 1.620899` (**`+0.158275` nats**, 95% CI `[+0.1399, +0.1774]`, `p=9.999e-5`)
+1. **Zero-Anchor Bare-Metal C++20/CUDA `sm_86` `33`-Kernel Engine (`kernels/`):**
+   - `siligemma_bench_sm86` (`namespace s184b` + R6-hardened `namespace siligemma`) loads both the shipped `slgb-v1` archive (`gemma4_formb_g32.slgb`, `2,094,062,080 B`, IEEE CRC-32 `flags=3`) and Stage-2 `slgb-v2`, linking strictly standard system libraries (`libc`, `libstdc++`, `libm`, `libgcc_s`) with **zero Python, PyTorch, `transformers`, `cuBLAS`, or Form-A CSR dependencies**.
+   - **`33` compiled `sm_86` kernels** (`57` total `ptxas` entries across `kernels/siligemma_kernels_sm86.cu` and `kernels/siligemma_bench_sm86.cu`) enforce **`<= 48` registers**, **`0 B` stack**, **`0 B` spill loads/stores**, and **`0` `LDL`/`STL`** SASS instructions.
+   - `tree_reduce_128_sm86` achieves **`0`-ULP** bit-identical binary reduction across CPU/GPU; `[16, 11, 4]` `1-LOP3 + 5-POPC` `SECDED` protects the `A_16` LSB parity plane (`0x11111111`), and `HoloSphereRazorCanary64` + `IRIS` passed **`3/3` LSB SEC repairs**, **`3/3` LSB DED traps**, and **`1/1` IRIS Trojan traps** in `run_gpu_selftest` (`--selftest-gpu`).
+2. **Stage-2 Exact `FP32` Logit Parity (`KG-GFB1 PASS`: `6.509e-5` / `cos = 0.9999999999993`):**
+   - Replaces Stage-1's 8-bit `dp4a` activation truncation (`0.8598` drift) and `BF16` KV/scale drift (`1.349` drift) with **3-limb radix-128 exact `dp4a22`** (`B=1`, `max_err = 6.509e-5` `4.5 bpw` / `6.104e-5` `BF16` `lm_head`, `cos = 0.9999999999993`, `6/6` top-1 exact) and **FP16-pair `mma.sync.m16n8k16`** Tensor Cores (`B=16`, `max_err = 1.125e-4`, `cos = 0.9999999999987`, `48/48` top-1 exact) against `FP32` `Gemma4ForCausalLM`, storing exact `FP32` KV inside preserved `kArena64KShadow`.
+   - Enforces `bos_token_id = 2` fail-closed, quantizes `276` live 2D text linears (`1,055,711,232 B` @ `4.5 bpw g=32`), omits **`60` dead `L15..34` `(k_proj, v_proj, k_norm)` tensors** (`18,880,512` params), packs `262` FP32 norm/scalar vectors (`285,987` params), allocates **`0 B` dynamic VRAM/heap** over `1,000` decode steps (**`2,388.06 MiB` = `2.33 GiB` @ `128K` ctx** live VRAM in `STAGE2_VERDICT.json`, vs `2,574.93 MiB` `kArena128K` theoretical arena / `2,744.94 MiB` Stage-1), and overlaps `17,920 B/tok` pinned host-DMA PLE with **`0.802%` stall**.
+3. **`3.87x` Batched Throughput, Hoisted `256 B` Woodbury (`1.89%`), & Joint `H1 × L25..33 K=2` Synergy:**
+   - Coalesced `uint4` `dp4a22` GEMV, fused `QKV`, fused `GeGLU+H_4+quant22`, 2-row `Split-K=8` `mlp_down`, and `mma.m16n8k16` lift throughput (`B=16 K=1`: `225.81 -> 873.20 tok/s`, **`3.87x`**; `B=1 K=1`: `89.50 -> 135.02 tok/s`, **`1.51x`**).
+   - Hoisted `c_wb_inv_256b` `8x8` Cayley–Woodbury steering on `L10..L14` incurs **`1.89%` overhead** (`wb_err = 1.192e-7`, `norm_drift = 2.299e-9`, `0` KV writes in `L15..34`).
+   - Joint **`H1` (`L10..L14` hub) × `L25..L33` `K=2` (`44L`)** contracts (`rho_hat = 0.1720`, `rho_cuda = 0.000517 << 0.6180`, **`0 B` extra KV**, **`0 B` extra bulk weights**) and improves held-out splits (`H1 K=1 -> H1+U4 K=2 tuned`: `WT2_test` `140.702 -> 128.413`, NLL `-0.0914`, `p=9.999e-5`; `Countdown_test` NLL `-0.0444`, `p=9.999e-5`; `GSM8K_OOD` NLL **`-0.2559`**, `p=9.999e-5`; Base `K=1 -> K=2`: `WT2` `213.835 -> 198.273`, `GSM8K Acc` `15.63% -> 18.75%`).
 
 ---
 
-## Verified RTX 3080 (`sm_86`) Scorecard & Honest Law-4 Scope
+## Measured RTX 3080 (`sm_86`) Stage-2 Scorecard, NVML Energy & Honest Limitations
 
-All GPU measurements were run on an `NVIDIA GeForce RTX 3080 Laptop GPU (8,192 MiB, sm_86)` with **`energy_power_status = UNCONTROLLED_LAPTOP_NOT_CLAIMED`**.
+All GPU timings and NVML power measurements were run on an `NVIDIA GeForce RTX 3080 Laptop GPU (8,192 MiB, sm_86)` with **`energy_power_status = UNCONTROLLED_LAPTOP_NOT_CLAIMED`** (live D2D `cudaMemcpy` peak = **`357.78 GB/s`**).
 
-| Batch | Depth (`K`) | `lm_head` Mode | Median (ms) | p95 (ms) | Throughput (`tok/s`) |
-|---:|---:|---|---:|---:|---:|
-| `B=1` | `K=1` (`35L`) | `4.5bpw_shadow` | 11.173 | 11.184 | **89.50** |
-| `B=1` | `K=1` (`35L`) | `bf16_tied` | 12.729 | 12.789 | **78.56** |
-| `B=1` | `K=2` (`44L`) | `4.5bpw_shadow` | 17.105 | 17.119 | **58.46** |
-| `B=1` | `K=2` (`44L`) | `bf16_tied` | 18.656 | 18.669 | **53.60** |
-| `B=1` | `K=3` (`53L`) | `4.5bpw_shadow` | 23.036 | 23.053 | **43.41** |
-| `B=1` | `K=3` (`53L`) | `bf16_tied` | 24.588 | 24.603 | **40.67** |
-| `B=16` | `K=1` (`35L`) | `4.5bpw_shadow` | 70.855 | 71.761 | **225.81** |
-| `B=16` | `K=1` (`35L`) | `bf16_tied` | 76.040 | 76.618 | **210.41** |
-| `B=16` | `K=2` (`44L`) | `4.5bpw_shadow` | 91.279 | 91.691 | **175.29** |
-| `B=16` | `K=2` (`44L`) | `bf16_tied` | 96.270 | 96.536 | **166.20** |
-| `B=16` | `K=3` (`53L`) | `4.5bpw_shadow` | 110.836 | 111.828 | **144.36** |
-| `B=16` | `K=3` (`53L`) | `bf16_tied` | 116.292 | 116.563 | **137.59** |
+| Batch | Depth (`K`) | `lm_head` Mode | Ctx (`T`) | Latency (`ms`) | Throughput (`tok/s`) | Speedup vs. Stage-1 / Notes | NVML (`W` / `J/tok` / `tok/J` / `peak °C`) |
+|---:|---:|---|---:|---:|---:|:---|:---|
+| `B=1` | `K=1` (`35L`) | `4.5bpw_shadow` | `128` | 7.406 | **135.02** | `1.51x` (`89.50 -> 135.02`, `173.12 GB/s`) | `73.49 W` · `0.5462 J/tok` · `1.831 tok/J` · `70 °C` |
+| `B=1` | `K=1` (`35L`) | `bf16_tied` | `128` | 8.991 | **111.23** | `1.42x` vs Stage-1 `78.56` (`206.99 GB/s`) | `—` |
+| `B=1` | `K=1` (`35L`) | `4.5bpw_shadow` | `1024` | 8.773 | **113.98** | Full-window context | `—` |
+| `B=1` | `K=2` (`44L`) | `4.5bpw_shadow` | `128` | 9.421 | **106.15** | `1.82x` vs Stage-1 `58.46` (`0 B` extra KV) | `79.80 W` · `0.7520 J/tok` · `1.330 tok/J` · `71 °C` |
+| `B=1` | `K=2` (`44L`) | `bf16_tied` | `128` | 10.929 | **91.50** | `1.71x` vs Stage-1 `53.60` (`0 B` extra KV) | `—` |
+| `B=16` | `K=1` (`35L`) | `4.5bpw_shadow` | `128` | 18.324 | **873.20** | **`3.87x`** (`225.81 -> 873.20`) | `79.87 W` · **`0.0919 J/tok`** · **`10.879 tok/J`** · `72 °C` |
+| `B=16` | `K=1` (`35L`) | `bf16_tied` | `128` | 19.861 | **805.62** | **`3.83x`** (`210.41 -> 805.62`) | `—` |
+| `B=16` | `K=2` (`44L`) | `4.5bpw_shadow` | `128` | 22.882 | **699.23** | **`3.99x`** (`175.29 -> 699.23`, `0 B` extra KV) | `79.90 W` · `0.1151 J/tok` · `8.689 tok/J` · `72 °C` |
 
-- **Honest Stage-1 `KG-GFB1` / `KG-GFB3` Disposition (`overall_disposition = KILL_FALSIFIED`):**
-  - `KG-GFB2` (`PASS`) and `KG-GFB4` (`PASS`) passed cleanly.
-  - `KG-GFB1` logged `KILL_FALSIFIED` because Stage-1 8-bit `dp4a` activation quantization + `g=32` Form B vs `g=128` Form A `G0_Base_A16` differed by `max_abs=0.8598` (`cos=0.99966`) vs PyTorch Form B and `5.1771` (`cos=0.98820`) vs Form A `G0` (exceeding the `<= 1e-3` gate).
-  - `KG-GFB3` logged `KILL_FALSIFIED` because Stage-1 scalar-load `dp4a` GEMV hit `89.50 tok/s` (`B=1`, `K=1`) and `58.46 tok/s` (`B=1`, `K=2`) vs the preregistered `>= 190 / >= 155 tok/s` roofline floor.
-  - Both targets are isolated to Stage-1 `8`-bit activation quantization and unvectorized GEMV loads; multi-limb exact `dp4a` + `uint4` coalesced GEMV + `mma.m16n8k16` Stage-2 optimization is actively tracked in follow-up work.
+> [!NOTE]
+> Energy readings are not guaranteed to be consistent due to uncontrollable variables (thermal state, ambient temperature, fan curve, and dynamic power limits). *(Measured via `100 Hz` NVML INA3221 rail trapezoidal integration cross-checked within `<= 0.95 W` by `100 ms` `nvidia-smi`; see `nvmlDeviceGetTotalEnergyConsumption` drift disclosure in [`ahrazzle/SiliGemma-1.0`](https://huggingface.co/ahrazzle/SiliGemma-1.0).)*
+
+- **Honest Stage-2 Gate Disposition (`STAGE2_VERDICT.json`: `overall_verdict = FAIL_GATE` — `KG-GFB1=PASS`, `KG-GFB2=PASS`, `KG-GFB3=FAIL`, `KG-GFB4=PASS`, `provenance_tag = UNCONTROLLED_LAPTOP_NOT_CLAIMED`):**
+  - Stage-2 resolved Stage-1's parity (`KG-GFB1 PASS`: `0.8598 -> 6.509e-5`) and batched Tensor Core (`B=16`: `873.20 / 805.62 / 699.23 tok/s`) targets.
+  - `KG-GFB3` stays honestly `FAIL` solely because single-stream canonical `0`-ULP `B=1` hit `135.02 / 111.23 / 106.15 / 91.50 tok/s` (`173.12–206.99 GB/s`) below the strict `150 / 122 / 120 / 98 tok/s` floor (bounded by serial per-layer norm synchronization and small-matrix occupancy relative to the `357.78 GB/s` D2D stream peak).
+  - *Note on `slgb-v1` vs `slgb-v2`:* The shipped standalone `gemma4_formb_g32.slgb` archive (`slgb-v1`, `flags=3`) initializes the `U-4` slot to `K=1` identity (`wf=0, wg=0, mq=0`); `siligemma_bench_sm86` loads both `slgb-v1` and Stage-2 `slgb-v2` directly.
 
 ---
 
@@ -92,9 +88,9 @@ python3 -B tools/pack_siligemma_formb.py verify ./gemma4_formb_g32.slgb
 
 ---
 
-## Verified Inventory & Errata vs. Immutable Track S184 Docs
+## Verified Inventory & Errata vs. Immutable Track S184 / S184b Docs
 
-The files in `docs/` (`STAGE1_VERDICT.json`, `STAGE1_REPORT.md`, `PREREG_W22_GEMMA4_FORMB.json`, `ARCHITECTURE_FORMB_SILIGEMMA.md` SHA-256 `b7410d0c...`) and `kernels/siligemma_kernels_sm86.cu` (`5ee2e547...`) are preserved byte-identical to the executed **Track S184** RTX 3080 run (`EXPECTED_PINNED_SHA256` in `tests/test_siligemma_cpu.py`). Post-Stage-1 hardening and doc errata are recorded transparently below:
+The historical Stage-1 files in `docs/` (`STAGE1_VERDICT.json`, `STAGE1_REPORT.md`, `PREREG_W22_GEMMA4_FORMB.json`, `ARCHITECTURE_FORMB_SILIGEMMA.md` SHA-256 `b7410d0c...`) and Stage-2 files (`STAGE2_VERDICT.json`, `STAGE2_REPORT.md`, `PREREG_W22_GEMMA4_FORMB_S2.json`, `ARCHITECTURE_FORMB_S2.md` SHA-256 `2c0be6c7...`) are preserved byte-identical to their executed RTX 3080 runs (`EXPECTED_PINNED_SHA256` in `tests/test_siligemma_cpu.py`). `kernels/` carries the Stage-2 `33`-kernel upgrade (`namespace s184b` + R6-hardened `namespace siligemma`) with direct `slgb-v1` + `slgb-v2` loading. Post-Stage-1 hardening and doc errata are recorded transparently below:
 
 | Item | Historical S184 Doc Value | Verified Code / Artifact Value & Clarification |
 |---|---|---|

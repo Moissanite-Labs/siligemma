@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Track S184 (EXP-Q81): SiliGemma-Native Form B Static Arena, Zero-Anchor Wire
-// Layout, Canonical P223c Reduction Trees, P224a IRIS/SECDED Telemetry, & CPU Reference.
+// SiliGemma 1.0: SiliGemma-Native Form B Static Arena, Zero-Anchor Wire
+// Layout, Canonical 0-ULP Reduction Trees, IRIS/SECDED Telemetry, & CPU Reference.
 //
 // Pure C++20 header (compiles standalone under g++ -std=c++20 AND under nvcc -arch=sm_86).
 // Zero third-party Python/PyTorch/transformers/cuBLAS anchors.
@@ -83,7 +83,7 @@ static constexpr uint64_t LOOP_SEGMENT_G32_BYTES     = 326025216ULL;
 static constexpr uint64_t LOOP_SEGMENT_G128_BYTES    = 298856448ULL;
 static constexpr uint32_t MAX_LOOP_PASSES            = 3u;
 
-// Contraction & Safety Thresholds (P224c RiccatiDecoupling, S96, S164, P224a IRIS)
+// Contraction & Safety Thresholds (Riccati Decoupling, Step-Ratio Bound, IRIS Canary)
 static constexpr double   RICCATI_RHO_LIMIT          = 0.6180;       // rho < 0.6180 (G3 <= 2)
 static constexpr float    S164_STEP_RATIO_LIMIT      = 1.5f;         // s_p < 1.5
 static constexpr float    LOOP_EXIT_COS_MIN          = 0.75f;
@@ -93,14 +93,14 @@ static constexpr uint32_t WOODBURY_DIM               = 8u;
 static constexpr size_t   WOODBURY_CONST_BYTES       = 256u;         // 8x8 FP32 = 256 B
 static constexpr int32_t  BATCH_ENVELOPE_MAX         = 16;
 
-// Exact Arena Partition Constants (PREREG_W22_GEMMA4_FORMB.json)
+// Exact Arena Partition Constants
 static constexpr uint64_t KV_RING_SLIDING_BYTES      = 6291456ULL;   // 12 * 512 * 2 * 256 * 2
 static constexpr uint64_t PLE_STAGE_BYTES            = 573440ULL;    // 2 * 16 * 17,920 B
 static constexpr uint64_t ACTIVATION_SCRATCH_BYTES   = 20217856ULL;  // P7 B=16 static workspace
 static constexpr uint64_t CANARY_TELEMETRY_BYTES     = 65536ULL;     // P8 64 KiB Canary+Telemetry
 
 // ----------------------------------------------------------------------------
-// 2. P224a IRIS + [16, 11, 4] 64-Byte Telemetry Canary & Watchdog ABI
+// 2. IRIS + [16, 11, 4] 64-Byte Telemetry Canary & Watchdog ABI
 // ----------------------------------------------------------------------------
 
 struct alignas(64) HoloSphereRazorCanary64 {
@@ -383,7 +383,7 @@ constexpr SiliGemmaArenaLayout compute_siligemma_arena_layout(
     return lay;
 }
 
-// Compile-time verification against PREREG_W22_GEMMA4_FORMB.json exact byte budgets
+// Compile-time verification against pinned arena exact byte budgets
 static constexpr SiliGemmaArenaLayout kArena16K = compute_siligemma_arena_layout(16384u, 32u, false);
 static constexpr SiliGemmaArenaLayout kArena64KShadow = compute_siligemma_arena_layout(65536u, 32u, true);
 static constexpr SiliGemmaArenaLayout kArena128K = compute_siligemma_arena_layout(131072u, 32u, false);
@@ -753,7 +753,7 @@ inline size_t next_power_of_two(size_t n) noexcept {
     return p;
 }
 
-// P223c 0-ULP Fixed-Shape 7-Stage Binary Reduction Tree (matches tree_reduce_128_sm86 bit-for-bit)
+// 0-ULP Fixed-Shape 7-Stage Binary Reduction Tree (matches tree_reduce_128_sm86 bit-for-bit)
 inline float tree_reduce_128_cpu(std::array<float, 128>& tile) noexcept {
     for (size_t half = 64u; half >= 1u; half >>= 1u) {
         for (size_t t = 0u; t < half; ++t) {
@@ -997,5 +997,269 @@ inline WatchdogAction evaluate_canary_watchdog(
 }
 
 }  // namespace siligemma
+
+
+namespace s184b {
+
+// Core model geometry (google/gemma-4-E2B-it text decoder)
+constexpr uint32_t SLGB_MAGIC = 0x534C4734u; // "SLG4"
+constexpr uint32_t SLGB_VERSION = 2u;
+constexpr int NUM_LAYERS = 35;
+constexpr int NUM_KV_LAYERS = 15;       // L0..L14 write KV; L15..L34 share L13 (sliding) / L14 (full)
+constexpr int FIRST_SHARED_LAYER = 15;
+constexpr int LAST_SLIDING_KV_LAYER = 13;
+constexpr int LAST_FULL_KV_LAYER = 14;
+constexpr int HIDDEN_SIZE = 1536;
+constexpr int INTERM_BASE = 6144;
+constexpr int INTERM_WIDE = 12288;      // double-wide MLP on shared-KV layers L15..L34
+constexpr int NUM_HEADS = 8;
+constexpr int NUM_KV_HEADS = 1;
+constexpr int HEAD_DIM_SLIDE = 256;
+constexpr int HEAD_DIM_FULL = 512;
+constexpr int SLIDING_WINDOW = 512;
+constexpr int PLE_DIM = 256;
+constexpr int VOCAB_SIZE = 262144;
+constexpr int GROUP_SIZE_G32 = 32;
+constexpr int GROUP_SIZE_G128 = 128;
+constexpr float RMS_NORM_EPS = 1.0e-6f;
+constexpr float FINAL_LOGIT_SOFTCAP = 30.0f;
+
+// Verified weight inventory & exact wire byte constants
+constexpr int LIVE_LINEAR_COUNT = 276;         // 35*7 + 15*2 + 1 (per_layer_model_projection)
+constexpr int DEAD_KV_TENSORS_OMITTED = 60;    // L15..L34 (k_proj, v_proj, k_norm) + v_norm absent
+constexpr uint64_t WIRE_BYTES_G32_45BPW = 1055711232ULL;
+constexpr uint64_t WIRE_BYTES_G128_4125BPW = 967735296ULL;
+constexpr uint64_t WIRE_BYTES_LM_HEAD_G32 = 226492416ULL;
+constexpr uint64_t WIRE_BYTES_LM_HEAD_BF16 = 805306368ULL;
+
+// Preserved Static Arena Partitions (bytes)
+constexpr uint64_t kArena16K = 1995364608ULL;
+constexpr uint64_t kArena64KShadow = 2523846912ULL;  // P5 KV = 408,944,640 B (fits FP32 KV up to B=16 T=1024 = 402,653,184 B!)
+constexpr uint64_t kArena128K = 2700007680ULL;       // BF16 KV = 811,597,824 B -> 2744.94 MiB <= 3072 MiB!
+constexpr uint64_t ARENA_P5_SHADOW_BYTES = 408944640ULL;
+constexpr uint64_t ARENA_P5_128K_BF16_BYTES = 811597824ULL;
+constexpr uint64_t ARENA_P7_SCRATCH_BYTES = 20217856ULL;
+constexpr uint64_t MAX_128K_VRAM_MIB = 3072ULL;
+
+// U-4 Loop Controller & Woodbury Hub Steering Constants
+constexpr int U4_LOOP_START = 25;
+constexpr int U4_LOOP_END = 33;          // L25..L33 inclusive = 9 layers -> K=2 total 44L
+constexpr int U4_RANK = 16;
+constexpr int WOODBURY_RANK = 8;
+constexpr int WOODBURY_HUB_START = 10;
+constexpr int WOODBURY_HUB_END = 14;     // L10..L14 20x shared_KV hub
+
+// Exact 64-byte Hardware Canary Struct (IRIS + Hamming(16,11) SECDED)
+struct alignas(64) HoloSphereRazorCanary64 {
+    uint64_t iris_state;
+    uint32_t sec_cnt;
+    uint32_t ded_cnt;
+    uint32_t poisoned;
+    uint32_t step_ctr;
+    uint32_t u4_passes;
+    uint32_t wb_applied;
+    uint64_t checksum;
+    uint64_t reserved[3];
+};
+static_assert(sizeof(HoloSphereRazorCanary64) == 64, "Canary must stay 64 bytes");
+
+enum LinearId : uint32_t {
+    LIN_Q = 0,
+    LIN_K = 1,
+    LIN_V = 2,
+    LIN_O = 3,
+    LIN_GATE = 4,
+    LIN_UP = 5,
+    LIN_DOWN = 6,
+    LIN_PLE_GATE = 7,
+    LIN_PLE_PROJ = 8,
+    LIN_PLE_MODEL_PROJ = 9,
+    LIN_LM_HEAD_G32 = 10
+};
+
+struct SiliGemmaLinearDesc {
+    uint32_t layer_idx;
+    uint32_t kind;
+    uint32_t out_features;
+    uint32_t in_features;
+    uint64_t offset_u4;   // element offset (uint4) into bulk packed weights
+    uint64_t offset_sc;   // element offset (__half) into bulk scales
+};
+
+struct SiliGemmaLayerDesc {
+    uint32_t layer_idx;
+    uint32_t is_full_attn;
+    uint32_t is_kv_shared;
+    uint32_t kv_slot;          // 0..14 for non-shared or reused slot (13 sliding, 14 full)
+    uint32_t head_dim;
+    uint32_t interm_size;
+    int32_t sliding_window;    // 0 if full, 512 if sliding
+    float layer_scalar;
+    uint64_t off_in_nw;        // FP32 element offset into scalar/norm pool
+    uint64_t off_qn_w;
+    uint64_t off_kn_w;         // UINT64_MAX if shared
+    uint64_t off_pa_nw;
+    uint64_t off_pf_nw;
+    uint64_t off_pff_nw;
+    uint64_t off_ppl_nw;
+    uint32_t lin_q;
+    uint32_t lin_k;            // UINT32_MAX if shared
+    uint32_t lin_v;            // UINT32_MAX if shared
+    uint32_t lin_o;
+    uint32_t lin_gate;
+    uint32_t lin_up;
+    uint32_t lin_down;
+    uint32_t lin_ple_gate;
+    uint32_t lin_ple_proj;
+    uint32_t pad_;
+};
+static_assert(sizeof(SiliGemmaLinearDesc) == 32, "SiliGemmaLinearDesc must stay 32 bytes");
+static_assert(sizeof(SiliGemmaLayerDesc) == 128, "SiliGemmaLayerDesc must stay 128 bytes");
+
+struct SlgbHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t num_layers;
+    uint32_t num_kv_layers;
+    uint32_t hidden_size;
+    uint32_t vocab_size;
+    uint32_t ple_dim;
+    uint32_t num_linears;       // 276 (+ optional lm_head g32 => 277)
+    uint32_t has_lm_head_g32;
+    uint32_t has_lm_head_bf16;
+    uint32_t has_ple_embed_bf16;
+    uint32_t has_u4_loop;
+    uint64_t total_u4_count;
+    uint64_t total_sc_count;
+    uint64_t total_norm_f32_count;
+    uint64_t u4_gate_f32_count;
+    float embed_scale;
+    float ple_model_proj_scale;
+    float ple_input_scale;
+    float softcap;
+};
+static_assert(sizeof(SlgbHeader) == 96, "SlgbHeader must stay 96 bytes");
+
+// Exact canonical 128-lane tree reduction matching CUDA `tree_reduce_128_sm86` to 0-ULP!
+inline float canonical_tree_reduce_128_cpu(const float* xs) {
+    float cur[128];
+    for (int i = 0; i < 128; ++i) cur[i] = xs[i];
+    // Warp 5-stage butterfly xor reductions (masks 1, 2, 4, 8, 16)
+    float warps[4];
+    for (int w = 0; w < 4; ++w) {
+        float lane[32];
+        for (int i = 0; i < 32; ++i) lane[i] = cur[w * 32 + i];
+        for (int stride = 1; stride <= 16; stride <<= 1) {
+            float nxt[32];
+            for (int i = 0; i < 32; ++i) nxt[i] = lane[i] + lane[i ^ stride];
+            for (int i = 0; i < 32; ++i) lane[i] = nxt[i];
+        }
+        warps[w] = lane[0];
+    }
+    return (warps[0] + warps[1]) + (warps[2] + warps[3]);
+}
+
+// Exact CPU Hamming(16,11) SECDED syndrome check matching device `secded_syn`!
+inline uint32_t secded_syn_cpu(uint64_t w64) {
+    const uint32_t w0 = static_cast<uint32_t>(w64);
+    const uint32_t w1 = static_cast<uint32_t>(w64 >> 32);
+    const uint32_t px = (w0 ^ w1) & 0x11111111u;
+    const uint32_t p0 = static_cast<uint32_t>(__builtin_popcount(px)) & 1u;
+    const uint32_t s0 = static_cast<uint32_t>(__builtin_popcount(px & 0x10101010u)) & 1u;
+    const uint32_t s1 = static_cast<uint32_t>(__builtin_popcount(px & 0x11001100u)) & 1u;
+    const uint32_t s2 = static_cast<uint32_t>(__builtin_popcount(px & 0x11110000u)) & 1u;
+    const uint32_t s3 = static_cast<uint32_t>(__builtin_popcount(w1 & 0x11111111u)) & 1u;
+    return p0 | (s0 << 1) | (s1 << 2) | (s2 << 3) | (s3 << 4);
+}
+
+// IRIS 64-bit mixing step matching GPU `iris_canary_finalize_sm86`
+inline uint64_t iris_mix_u64(uint64_t state, uint64_t val) {
+    state ^= val + 0x9E3779B97F4A7C15ULL + (state << 6) + (state >> 2);
+    state *= 0xBF58476D1CE4E5B9ULL;
+    state ^= (state >> 31);
+    return state;
+}
+
+// Encode a 64-bit word (16 4-bit nibbles) so SECDED syndrome == 0, adjusting parity nibbles {0,1,2,4,8} minimally.
+inline uint64_t encode_secded_w64_cpu(uint64_t w64) {
+    uint32_t w0 = static_cast<uint32_t>(w64);
+    uint32_t w1 = static_cast<uint32_t>(w64 >> 32);
+    auto nib_bit0 = [](uint32_t word, int idx) -> uint32_t { return (word >> (4 * idx)) & 1u; };
+    auto set_nib_bit0 = [](uint32_t& word, int idx, uint32_t b) {
+        const uint32_t shift = static_cast<uint32_t>(4 * idx);
+        if ((word & (1u << shift)) != (b << shift)) {
+            int32_t nib = static_cast<int32_t>((word >> shift) & 0xFu);
+            int32_t sv = (nib << 28) >> 28; // signed [-8..7]
+            sv = (sv < 7) ? (sv + 1) : (sv - 1);
+            word = (word & ~(0xFu << shift)) | (static_cast<uint32_t>(sv & 0xF) << shift);
+        }
+    };
+    // Solve s3 first via w1 nibble 0 (position 8):
+    uint32_t s3_rest = 0u;
+    for (int i = 1; i < 8; ++i) s3_rest ^= nib_bit0(w1, i);
+    set_nib_bit0(w1, 0, s3_rest);
+    auto px_bit = [&](int i) -> uint32_t { return nib_bit0(w0, i) ^ nib_bit0(w1, i); };
+    // Solve s2 via w0 nibble 4:
+    uint32_t target_b4 = nib_bit0(w1, 4) ^ px_bit(5) ^ px_bit(6) ^ px_bit(7);
+    set_nib_bit0(w0, 4, target_b4);
+    // Solve s1 via w0 nibble 2:
+    uint32_t target_b2 = nib_bit0(w1, 2) ^ px_bit(3) ^ px_bit(6) ^ px_bit(7);
+    set_nib_bit0(w0, 2, target_b2);
+    // Solve s0 via w0 nibble 1:
+    uint32_t target_b1 = nib_bit0(w1, 1) ^ px_bit(3) ^ px_bit(5) ^ px_bit(7);
+    set_nib_bit0(w0, 1, target_b1);
+    // Solve p0 via w0 nibble 0:
+    uint32_t target_b0 = nib_bit0(w1, 0);
+    for (int i = 1; i < 8; ++i) target_b0 ^= px_bit(i);
+    set_nib_bit0(w0, 0, target_b0);
+    return static_cast<uint64_t>(w0) | (static_cast<uint64_t>(w1) << 32);
+}
+
+// Compute exact 8x8 Woodbury-Cayley inverse (I + M)^{-1} where M = 0.5 * U^T V (or A) in FP64 -> float32
+inline bool invert_8x8_cpu(const float M_in[64], float inv_out[64]) {
+    double a[8][16];
+    for (int r = 0; r < 8; ++r) {
+        for (int c = 0; c < 8; ++c) {
+            a[r][c] = static_cast<double>(M_in[r * 8 + c]);
+            a[r][c + 8] = (r == c) ? 1.0 : 0.0;
+        }
+    }
+    for (int col = 0; col < 8; ++col) {
+        int piv = col;
+        double best = std::fabs(a[col][col]);
+        for (int r = col + 1; r < 8; ++r) {
+            double v = std::fabs(a[r][col]);
+            if (v > best) { best = v; piv = r; }
+        }
+        if (best < 1e-12) return false;
+        if (piv != col) {
+            for (int c = 0; c < 16; ++c) std::swap(a[col][c], a[piv][c]);
+        }
+        const double inv_d = 1.0 / a[col][col];
+        for (int c = 0; c < 16; ++c) a[col][c] *= inv_d;
+        for (int r = 0; r < 8; ++r) {
+            if (r == col) continue;
+            const double f = a[r][col];
+            for (int c = 0; c < 16; ++c) a[r][c] -= f * a[col][c];
+        }
+    }
+    for (int r = 0; r < 8; ++r)
+        for (int c = 0; c < 8; ++c)
+            inv_out[r * 8 + c] = static_cast<float>(a[r][c + 8]);
+    return true;
+}
+
+inline void fwht4_cpu(float* x, int n) {
+    for (int i = 0; i < n; i += 4) {
+        const float x0 = x[i + 0], x1 = x[i + 1], x2 = x[i + 2], x3 = x[i + 3];
+        const float a0 = x0 + x1, a1 = x0 - x1, a2 = x2 + x3, a3 = x2 - x3;
+        x[i + 0] = (a0 + a2) * 0.5f;
+        x[i + 1] = (a1 + a3) * 0.5f;
+        x[i + 2] = (a0 - a2) * 0.5f;
+        x[i + 3] = (a1 - a3) * 0.5f;
+    }
+}
+
+} // namespace s184b
 
 #endif  // SILIGEMMA_ARENA_HPP

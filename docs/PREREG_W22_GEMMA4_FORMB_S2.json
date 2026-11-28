@@ -1,0 +1,94 @@
+{
+  "schema": "s184b.prereg.w22.gemma4_formb_s2.v1",
+  "track_id": "TRACK-S184B",
+  "queue_id": "EXP-Q81b",
+  "prereg_status": "LOCKED_PRE_RUN",
+  "architecture_doc": "ARCHITECTURE_FORMB_S2.md",
+  "architecture_sha256": "2c0be6c7cbddadd7990c0db09230e59dabff0385aa8a5cec39e7b617966721e1",
+  "model_anchors": {
+    "base_model": "google/gemma-4-E2B-it",
+    "base_config_json_sha256": "1b28f3d2c3100f6c594754b81107428bd7b822a7f48272ca681dae9d2ec38330",
+    "h1_staging_dir": "$HOME/hf-releases/staging-gemma4-e2b-forma-final",
+    "h1_config_json_sha256": "f1fe1e00cbfd3856e3b3925d2edbc7986ff5bcbd94c74371d418f2f9bec2d671",
+    "h1_model_safetensors_sha256": "a577b9ab55c36e5edb7140cf6477c8fbf957597ecfa5f30f4daed8c1f5290225",
+    "bos_token_id": 2,
+    "live_linear_count": 276,
+    "dead_kv_tensors_omitted": 60,
+    "wire_bytes_g32_45bpw": 1055711232,
+    "wire_bytes_g128_4125bpw": 967735296
+  },
+  "dataset_anchors": {
+    "gsm8k_main_train_parquet_sha256": "ea82612ea9582142387730c793eb67d3b12849002bc0b7fa6f8efafa7351419d",
+    "gsm8k_main_test_parquet_sha256": "ee7b8da9e381df27b9e3f7758a159ab2bdaa4dbaa910546cbbc47e0cb44e4f59",
+    "wikitext2_raw_test_parquet_sha256": "5f1bea067869d04849c0f975a2b29c4ff47d867f484f5010ea5e861eab246d91",
+    "wikitext2_raw_validation_parquet_sha256": "204929b7ff9d6184953f867dedb860e40aa69c078fc1e54b3baaa8fb28511c4c",
+    "cd_train_n": 64,
+    "cd_test_n": 128,
+    "cd_seed_train": 175301,
+    "cd_seed_test": 175302,
+    "gsm_train_n": 64,
+    "gsm_ood_test_n": 64,
+    "wt2_val_chunks": 8,
+    "wt2_test_chunks": 16,
+    "wt2_chunk_len": 256
+  },
+  "arena_and_wire_contract": {
+    "kArena16K_bytes": 1995364608,
+    "kArena64KShadow_bytes": 2523846912,
+    "kArena128K_bytes": 2700007680,
+    "p5_shadow_max_bytes": 408944640,
+    "p7_scratch_bytes": 20217856,
+    "max_128k_vram_mib": 3072.0,
+    "max_dynamic_vram_delta_1k_steps": 0,
+    "max_ple_dma_stall_pct": 2.0
+  },
+  "kill_gates": {
+    "KG-GFB1": {
+      "description": "Exact numeric parity on REAL Gemma-4-E2B Form B weights + zero dynamic alloc + 0 non-bare-metal deps",
+      "b1_max_logit_err_max": 1.0e-3,
+      "b1_cos_min": 0.99999,
+      "b16_max_logit_err_max": 1.0e-3,
+      "b16_cos_min": 0.99999,
+      "tiny4_hf_e2e_max_logit_err_max": 1.0e-3,
+      "bos_fail_closed_required": true,
+      "zero_pytorch_cublas_csr_in_cuda": true
+    },
+    "KG-GFB2": {
+      "description": "sm_86 register/spill/SASS hygiene + 0-ULP tree_reduce + SECDED/IRIS + hoisted Woodbury",
+      "max_regs_per_kernel": 48,
+      "max_stack_bytes": 0,
+      "max_spill_bytes": 0,
+      "max_sass_ldl_stl_count": 0,
+      "max_tree_reduce_ulp": 0,
+      "sec_inject_required": "3/3",
+      "ded_inject_required": "3/3",
+      "iris_trojan_required": "1/1",
+      "woodbury_inv8_max_err": 1.0e-6,
+      "woodbury_norm_drift_max": 1.0e-6,
+      "woodbury_overhead_pct_max": 25.0
+    },
+    "KG-GFB3": {
+      "description": "RTX 3080 sm_86 CUDA Graph throughput vs live cudaMemcpy stream ceiling (UNCONTROLLED_LAPTOP_NOT_CLAIMED)",
+      "provenance_tag": "UNCONTROLLED_LAPTOP_NOT_CLAIMED",
+      "b1_k1_g32_toks_min": 150.0,
+      "b1_k1_bf16_toks_min": 122.0,
+      "b1_k2_g32_toks_min": 120.0,
+      "b1_k2_bf16_toks_min": 98.0,
+      "b16_k1_g32_toks_min": 750.0,
+      "b16_k1_bf16_toks_min": 700.0,
+      "b16_k2_g32_toks_min": 600.0,
+      "single_gemv_peak_frac_of_d2d_min": 0.85,
+      "b1_speedup_over_s184_bf16_min": 1.35,
+      "b16_speedup_over_s184_min": 3.0
+    },
+    "KG-GFB4": {
+      "description": "0 B-KV L25..33 K=2 loop integrity + Joint U-4 x H1 Form A synergy evaluation",
+      "extra_kv_bytes": 0,
+      "extra_bulk_weight_bytes": 0,
+      "rho_hat_max": 0.61803398875,
+      "s164_sp_max": 1.5,
+      "wt2_max_regression_ppl": 0.05,
+      "report_honest_h1_synergy_with_bootstrap_ci": true
+    }
+  }
+}

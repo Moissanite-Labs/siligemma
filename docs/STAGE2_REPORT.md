@@ -1,0 +1,6 @@
+# Track S184b (`EXP-Q81b` — Gemma-4-E2B Form B Stage-2) Report
+- **Overall Verdict:** `FAIL_GATE` | `KG-GFB1=PASS`, `KG-GFB2=PASS`, `KG-GFB3=FAIL`, `KG-GFB4=PASS`
+- **Parity (`KG-GFB1`):** `B=1 dp4a22` (`4.5bpw`) `max_err=6.509e-05`, `cos=1.0000000`; `B=1` (`BF16 lm_head`) `max_err=6.104e-05`; `B=16 mma` `max_err=1.125e-04`, `cos=1.0000000` (vs S184 BF16 ablation `max_err=1.349e+00`).
+- **Silicon (`KG-GFB2`):** `SASS LDL/STL=0`, `max_ulp=0`, `sec=3/3`, `ded=3/3`, `iris=1/1`, `woodbury_overhead=1.89%`, `ple_dma_stall=0.802%`, `dyn_vram_1k=0 B`, `128K VRAM=2388.06 MiB <= 3072`.
+- **Throughput (`KG-GFB3`, `UNCONTROLLED_LAPTOP_NOT_CLAIMED`):** Live D2D `cudaMemcpy` = `357.78 GB/s`. `B=1 K=1` `4.5bpw=135.02 tok/s` (`173.1 GB/s`), `BF16=111.23 tok/s` (`207.0 GB/s`); `B=1 K=2` `4.5bpw=106.15`, `BF16=91.50`; `B=16 K=1` `4.5bpw=873.20`, `BF16=805.62`, `K=2 4.5bpw=699.23 tok/s`.
+- **Joint `U-4 x H1` (`KG-GFB4`):** `Base K=1 -> K=2`: WT2 `213.835 -> 198.273`, CD `0.1094 -> 0.1016` (NLL `0.8064 -> 0.7473`), GSM8K `0.1562 -> 0.1875`. `H1 K=1 -> H1+U4 K=2 (tuned)`: WT2 `140.702 -> 128.413`, CD `0.1328 -> 0.1172` (NLL `0.8116 -> 0.7672`), GSM8K `0.3438 -> 0.2969` (`rho_hat=0.1720`, `rho_cuda=0.0005`).
