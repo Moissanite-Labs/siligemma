@@ -41,7 +41,7 @@ if str(TOOLS_DIR) not in sys.path:
 import pack_siligemma_formb as packer  # noqa: E402
 
 EXPECTED_PINNED_SHA256 = {
-    "Makefile": "7cb15397c024c1f0cc47efb6a9b67fad17b6a276023e5631e1366cb56e7271df",
+    "Makefile": "fd29babfd791105dd44338af6c219913ae451d9926e286eea7163c3812b5fe79",
     "docs/ARCHITECTURE_FORMB_S2.md": "2c0be6c7cbddadd7990c0db09230e59dabff0385aa8a5cec39e7b617966721e1",
     "docs/ARCHITECTURE_FORMB_SILIGEMMA.md": "b7410d0c491748632585f884115d8241efe0b837290ce164e78fe41a0b074fd6",
     "docs/PREREG_W22_GEMMA4_FORMB.json": "03724afa55d9008675225ae48cf78bc2fdcd180418ec6a5ad60a4e15facf37e0",
@@ -50,9 +50,11 @@ EXPECTED_PINNED_SHA256 = {
     "docs/STAGE1_VERDICT.json": "d67403ae29265313d163e93ea0184ef5eb9c17e4a5786c89bff186540df4c97b",
     "docs/STAGE2_REPORT.md": "cd62bf80b779250d81a4ddc7023489a29bc73ab5d2bb6997f0774fac3d4f60d1",
     "docs/STAGE2_VERDICT.json": "69fc6ccf412b79dcfbe7019a9ec2b66d3190bd10dbbe50aea8e3eee90588f8e2",
-    "kernels/siligemma_arena.hpp": "812c0cf4a0fdd1875dc4d6f013dd4316148f13a4c743e5346b5392c52c368dda",
-    "kernels/siligemma_bench_sm86.cu": "ff0773219be6ced4847877aef10eda6c5a3a45b6737291626993823d86b619e7",
-    "kernels/siligemma_kernels_sm86.cu": "88e3ab30be9c041bc98247f9eb670de8fe6f402f9b7e80711d7fa017fa17a4c8",
+    "docs/V2_REPORT.md": "da88d0c21980e585656115651781bc9b7acc4e708174fee95e3388d7c5c9ad42",
+    "docs/V2_VERDICT.json": "211f4cebbed453da8cf991a71c0d54f5836b765d583911391fd00223619e98c9",
+    "kernels/siligemma_arena.hpp": "7f4a9db040488b8d67c4b52130491b7d9fd77ada0fd3439b41a0301591e5c4a1",
+    "kernels/siligemma_bench_sm86.cu": "b2fa75a72304bd791af8537c7b6505a28eacc7cad3a1f2e566292f99c1394b70",
+    "kernels/siligemma_kernels_sm86.cu": "0436f04abc2fdb5f3528509b81f4cdabcb47f406f1ae2645910a8fc9047b93b4",
     "tools/pack_siligemma_formb.py": "689ed377f7bd32061c0bf01561bae2a665c2b2320b282e77a87e540f75a97faf",
     "tools/slgb_cpu_worker.cpp": "da51f06391612947efeebf66fa3b2224ff6f02701829fd14ca3ed7bed42e6516",
 }
@@ -145,13 +147,15 @@ def f32_bits(val: float) -> int:
 
 def tree_reduce_128_py(tile: Sequence[float]) -> float:
     require_ok(len(tile) == 128, "TREE_LEN", f"expected 128 lanes, got {len(tile)}")
-    buf = [f32(v) for v in tile]
-    half = 64
-    while half >= 1:
-        for t in range(half):
-            buf[t] = f32(buf[t] + buf[t + half])
-        half >>= 1
-    return buf[0]
+    warps: list[float] = []
+    for w in range(4):
+        lane = [f32(tile[w * 32 + i]) for i in range(32)]
+        stride = 1
+        while stride <= 16:
+            lane = [f32(lane[i] + lane[i ^ stride]) for i in range(32)]
+            stride <<= 1
+        warps.append(lane[0])
+    return f32(f32(warps[0] + warps[1]) + f32(warps[2] + warps[3]))
 
 
 def canonical_tree_sum_block128_py(vals: Sequence[float]) -> float:
@@ -415,9 +419,15 @@ int main() {{
     if (ded_syn == 0u || (ded_syn & 1u) != 0u) return 9;
 
     siligemma::HoloSphereRazorCanary64 canary{{}};
-    canary.ded_count_u32 = 1u;
+    canary.sec_cnt = 1u;
+    canary.poisoned = 0u;
+    if (siligemma::evaluate_canary_watchdog(canary, 0u, false) != siligemma::WatchdogAction::CONTINUE) return 39;
+    canary.ded_cnt = 1u;
     if (siligemma::evaluate_canary_watchdog(canary, 0u, false) != siligemma::WatchdogAction::SAFE_HALT_DED_ROLLBACK) return 10;
-    canary.ded_count_u32 = 0u;
+    canary.ded_cnt = 0u;
+    canary.poisoned = 1u;
+    if (siligemma::evaluate_canary_watchdog(canary, 0u, false) != siligemma::WatchdogAction::SAFE_HALT_DED_ROLLBACK) return 40;
+    canary.poisoned = 0u;
     canary.iris_runtime_crc_u32 = siligemma::iris_mix_word_cpu(0u, 0x12345678u);
     if (siligemma::evaluate_canary_watchdog(canary, canary.iris_runtime_crc_u32 ^ 1u, true) != siligemma::WatchdogAction::SAFE_HALT_DED_ROLLBACK) return 11;
 
@@ -456,14 +466,42 @@ int main() {{
     if (siligemma::evaluate_riccati_loop_guard(tiny_pos.data(), tiny_neg.data(), zero_d.data(), D, 3u, rho_z, sr_z, cos_z) != siligemma::ValidationError::ERR_S164_STEP_DIVERGENCE ||
         cos_z >= -0.99f) return 31;
 
-    // Stage-2 namespace s184b parity controls
+    // Stage-2 + V2 namespace s184b parity controls
     if (s184b::LIVE_LINEAR_COUNT != 276 || s184b::DEAD_KV_TENSORS_OMITTED != 60 ||
         s184b::kArena16K != siligemma::kArena16K.total_arena_bytes ||
         s184b::kArena64KShadow != siligemma::kArena64KShadow.total_arena_bytes ||
         s184b::kArena128K != siligemma::kArena128K.total_arena_bytes ||
+        s184b::kArena128KFormBG32 != 2121193728ULL ||
         s184b::WIRE_BYTES_G32_45BPW != 1055711232ULL) return 34;
     const uint64_t s2_cw = s184b::encode_secded_w64_cpu(0x0F1E2D3C4B5A6978ULL);
     if (s184b::secded_syn_cpu(s2_cw) != 0u) return 35;
+    // Full 64-bit Hamming(72,64) SECDED: clean=0, 1-bit SEC heal=1 (bit-exact restore), 2-bit DED=2
+    const uint64_t payload72 = 0x13572468ACE09753ULL;
+    const uint8_t ecc72 = siligemma::secded72_encode_cpu(payload72);
+    uint64_t w_clean = payload72;
+    if (siligemma::secded72_decode_heal_cpu(w_clean, ecc72) != 0 || w_clean != payload72) return 41;
+    uint64_t w_sec = payload72 ^ (1ULL << 37u);
+    if (siligemma::secded72_decode_heal_cpu(w_sec, ecc72) != 1 || w_sec != payload72) return 42;
+    uint64_t w_ded = payload72 ^ (1ULL << 5u) ^ (1ULL << 41u);
+    if (siligemma::secded72_decode_heal_cpu(w_ded, ecc72) != 2) return 43;
+    // Goodfire outlier guard + LoopCD-Hidden + P233c invariance + Double-GS QR
+    std::vector<float> h_r(D, 1.0f), h_b(D, 0.5f), h_spike(D, 1.0f);
+    h_r[438] = 141.0f; h_b[438] = -20.0f;
+    s184b::loopcd_hidden_extrap_cpu(h_r.data(), h_b.data(), -0.5f, static_cast<int>(D));
+    if (std::fabs(h_r[438] - 141.0f) > 1e-6f || std::fabs(h_r[0] - 0.75f) > 1e-6f) return 44;
+    float sr_clean_a = 0.0f, cos_clean_a = 0.0f, sr_clean_b = 0.0f, cos_clean_b = 0.0f;
+    s184b::p233c_clean_halt_metrics_cpu(vec, gam, static_cast<int>(D), sr_clean_a, cos_clean_a);
+    for (size_t i = 0; i < D; ++i) h_spike[i] = vec[i];
+    h_spike[438] = 9999.0f; h_spike[1295] = -8888.0f;
+    s184b::p233c_clean_halt_metrics_cpu(h_spike.data(), gam, static_cast<int>(D), sr_clean_b, cos_clean_b);
+    if (std::fabs(sr_clean_a - sr_clean_b) > 1e-6f || std::fabs(cos_clean_a - cos_clean_b) > 1e-6f) return 45;
+    std::vector<float> q_basis(2u * D, 0.0f), z_in(D), z_out(D);
+    q_basis[0] = 1.0f; q_basis[D + 1u] = 1.0f;
+    for (size_t i = 0; i < D; ++i) z_in[i] = vec[i];
+    z_in[0] += 50.0f; z_in[1] -= 30.0f;
+    double leak1 = 1.0, leak2 = 1.0;
+    s184b::double_gs_project_cpu(z_in.data(), q_basis.data(), 2, static_cast<int>(D), z_out.data(), &leak1, &leak2);
+    if (leak2 > s184b::S97_ORTH_LEAK_LIMIT) return 46;
     if (s184b::canonical_tree_reduce_128_cpu(vec) != tree_reduce_first128) return 36;
     float s2_M[64], s2_Minv[64];
     for (int r = 0; r < 8; ++r)
@@ -554,7 +592,7 @@ class TestSiliGemmaCPU(unittest.TestCase):
             bin_p = td_p / "ref_test"
             src_p.write_text(cpp_src, encoding="utf-8")
             c_proc = subprocess.run(
-                [str(cxx), "-O3", "-std=c++20", "-Wall", "-Wextra", "-Werror", f"-I{KERNELS_DIR}", str(src_p), "-lm", "-o", str(bin_p)],
+                [str(cxx), "-O3", "-std=c++20", "-Wall", "-Wextra", "-Werror", f"-I{KERNELS_DIR}", str(src_p), "-lm", "-ldl", "-lpthread", "-o", str(bin_p)],
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(c_proc.returncode, 0, f"g++ failed: {c_proc.stderr}")
@@ -652,6 +690,28 @@ class TestSiliGemmaCPU(unittest.TestCase):
         self.assertLess(float(s2_u["h1_forma_synergy"]["cal_meta"]["rho_hat"]), 0.61803398875)
         self.assertEqual(s2_verdict["kill_gates"]["KG-GFB4"], "PASS")
         self.assertEqual(s2_verdict["overall_verdict"], "FAIL_GATE")
+
+        v2_verdict = parse_strict_json_bytes(read_regular_bytes_nofollow(DOCS_DIR / "V2_VERDICT.json"), label="v2_verdict")
+        v2_report = read_regular_bytes_nofollow(DOCS_DIR / "V2_REPORT.md").decode("utf-8", "strict")
+        self.assertEqual(v2_verdict["verdict"], "PASS")
+        self.assertTrue(all(bool(val) for val in v2_verdict["kill_gates"].values()))
+        self.assertEqual(len(v2_verdict["kill_gates"]), 20)
+        self.assertGreaterEqual(int(v2_verdict["sass_ptx_audit"]["kernels"]), 47)
+        self.assertGreaterEqual(int(v2_verdict["sass_ptx_audit"]["so_kernels"]), 47)
+        self.assertLessEqual(int(v2_verdict["sass_ptx_audit"]["max_regs"]), 48)
+        self.assertEqual(int(v2_verdict["sass_ptx_audit"]["sass_ldl_stl"]), 0)
+        v2_p1 = v2_verdict["pillar1_runtime"]
+        self.assertGreaterEqual(float(v2_p1["b1_k1_g32_t128_toks"]), 150.0)
+        self.assertGreaterEqual(float(v2_p1["b16_k1_g32_t128_toks"]), 920.0)
+        self.assertLessEqual(float(v2_p1["exact_128k_alloc_mib"]), 2457.6)
+        self.assertGreater(float(v2_p1["rho_cuda"]), 0.0)
+        self.assertTrue(bool(v2_p1["u4_loaded"]))
+        v2_arms = v2_verdict["nvml_energy"]["arms"]
+        self.assertIn("b1_adaptive_live", v2_arms)
+        self.assertGreaterEqual(len(v2_arms), 7)
+        self.assertIn("UNCONTROLLED_LAPTOP_NOT_CLAIMED", v2_report)
+        self.assertLessEqual(float(v2_verdict["logit_parity"]["b1_k2_loopcd"]["max_abs_err"]), 1.0e-3)
+        self.assertGreater(float(v2_verdict["logit_parity"]["b1_k2_loopcd"]["max_abs_delta_vs_k1"]), 1.0e-3)
 
         self.assertEqual(a16_secded_syndrome_py(0), 0)
         syn1 = a16_secded_syndrome_py(1 << 20)
@@ -754,6 +814,13 @@ class TestSiliGemmaCPU(unittest.TestCase):
             validate_ptxas_and_sass(bad_reg, {"ldl_insns": 0, "stl_insns": 0}, min_kernels=33)
         with self.assertRaises(SiliGemmaGateError):
             validate_ptxas_and_sass(parsed, {"ldl_insns": 1, "stl_insns": 0}, min_kernels=33)
+        mk_txt = read_regular_bytes_nofollow(REPO_ROOT / "Makefile").decode("utf-8", "strict")
+        self.assertNotIn("-delete", mk_txt)
+        clean_idx = mk_txt.find("clean:")
+        self.assertGreater(clean_idx, 0)
+        clean_tail = mk_txt[clean_idx:]
+        self.assertNotIn("*", clean_tail)
+        self.assertNotIn("-rf", clean_tail)
 
 
 def main() -> int:
